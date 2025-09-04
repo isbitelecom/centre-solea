@@ -1,7 +1,7 @@
 # solea_api/routes/infos_agenda.py
 from flask import Blueprint, jsonify, request
 import re
-from datetime import date, timedelta, datetime
+from datetime import date
 from bs4 import NavigableString
 
 from ..utils import (
@@ -13,8 +13,7 @@ from ..utils import (
 bp = Blueprint("infos_agenda", __name__)
 SRC = "https://www.centresolea.org/agenda"
 
-# ---------------------------------------------------------------------------
-# Mois FR (plein + abréviations)
+# --- Mois FR (plein + abréviations usuelles, en minuscules, sans point final)
 MONTHS = {
     "janvier": 1, "janv": 1, "jan": 1,
     "février": 2, "fevrier": 2, "févr": 2, "fevr": 2, "fév": 2, "fev": 2,
@@ -27,174 +26,45 @@ MONTHS = {
     "septembre": 9, "sept": 9, "sep": 9,
     "octobre": 10, "oct": 10,
     "novembre": 11, "nov": 11,
-    "décembre": 12, "decembre": 12, "déc": 12, "dec": 12
+    "décembre": 12, "decembre": 12, "déc": 12, "dec": 12,
 }
 
-DAY_WORDS = {
-    "lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche",
-    "lun.","mar.","mer.","jeu.","ven.","sam.","dim.",
-    "lun","mar","mer","jeu","ven","sam","dim"
-}
+DAY_WORD = r"(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|lun\.?|mar\.?|mer\.?|jeu\.?|ven\.?|sam\.?|dim\.?)"
 
-INLINE_SEP_RX = re.compile(r"\s*(?:[:—–\-]\s+)", re.UNICODE)  # sépare "date : titre"
+# Exemple de plage DANS LE MÊME BLOC GRAS :
+# "Du lundi 27 au vendredi 31 octobre 2025"
+# "Dimanche 26 au jeudi 30 octobre"
+RANGE_RX = re.compile(
+    rf"(?i)^\s*(?:du\s+)?(?:{DAY_WORD}\s+)?(\d{{1,2}}(?:er)?)"      # jour 1
+    rf"(?:\s+([a-zéèêàâîïôöùûç\.]+))?\s*"                          # mois 1 (optionnel)
+    rf"(?:\s+(20\d{{2}}))?\s*"                                      # année 1 (optionnelle)
+    rf"(?:au|–|—|-)\s+(?:{DAY_WORD}\s+)?(\d{{1,2}}(?:er)?)\s+"     # 'au' + jour 2
+    rf"([a-zéèêàâîïôöùûç\.]+)\s*"                                  # mois 2 (obligatoire)
+    rf"(?:\s*(20\d{{2}}))?\s*$",                                    # année 2 (optionnelle)
+    re.UNICODE
+)
 
-RX_NUM = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b", re.IGNORECASE)
-RX_YEAR = re.compile(r"\b(20\d{2})\b")
+# Date simple DANS LE GRAS :
+# "Samedi 27 septembre 2025" / "sam. 27 sept." / "27/09[/2025]"
+SIMPLE_WORD_RX = re.compile(
+    rf"(?i)^\s*(?:{DAY_WORD}\s+)?(\d{{1,2}}(?:er)?)\s+([a-zéèêàâîïôöùûç\.]+)(?:\s+(20\d{{2}}))?\s*$"
+)
+SIMPLE_NUM_RX = re.compile(r"^\s*(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\s*$", re.IGNORECASE)
 
-# ---------------------------------------------------------------------------
-# Helpers parsing robustes
+INLINE_SEP_RX = re.compile(r"\s*(?:[:—–\-]\s+)", re.UNICODE)  # pour séparer "date : titre" DANS le même bloc
 
-def _year_default(mm: int | None) -> int:
-    # défaut simple: année courante
-    return datetime.now().year
 
 def _month_from_token(tok: str) -> int:
     t = (tok or "").strip().lower().rstrip(".")
     return MONTHS.get(t, 0)
 
-def _is_day_word(tok: str) -> bool:
-    return (tok or "").strip().lower().rstrip(".") in DAY_WORDS
 
-def _expand_range(d1: int, m1: int, y1: int, d2: int, m2: int, y2: int) -> list[str]:
-    try:
-        start = date(y1, m1, d1)
-        end = date(y2, m2, d2)
-        if end < start:
-            return []
-    except Exception:
-        return []
-    out, cur = [], start
-    while cur <= end:
-        out.append(f"{cur.day:02d}/{cur.month:02d}/{cur.year}")
-        cur += timedelta(days=1)
-    return out
+def _norm_txt(s: str) -> str:
+    return normalize_text(s or "")
 
-def _tokenize(s: str) -> list[str]:
-    # tokens alphanum (garde les points finaux style "sept.")
-    s = normalize_text(s or "")
-    s = s.replace("–", " au ").replace("—", " au ").replace("-", " au ")
-    return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9\.]+", s)
 
-def _parse_range_smart(date_part: str) -> list[str]:
-    """
-    Parse des formes :
-      - "Du lundi 27 au vendredi 31 octobre [2025]"
-      - "Dimanche 26 au jeudi 30 octobre[: ...]"
-      - "27 au 31 oct. 2025"
-    Mois obligatoire sur la seconde date, le premier hérite sinon.
-    Année : si absente → année courante.
-    """
-    toks = _tokenize(date_part)
-    if not toks:
-        return []
-
-    # repérer 'au' comme séparateur principal
-    try:
-        i_sep = [i for i,t in enumerate(toks) if t.lower() == "au"][0]
-    except IndexError:
-        return []
-
-    # zone gauche (avant 'au') : trouver dernier jour et éventuellement un mois juste après
-    left = toks[:i_sep]
-    right = toks[i_sep+1:]
-
-    # jour gauche = dernier nombre dans left
-    d1 = None; m1 = None
-    for i in range(len(left)-1, -1, -1):
-        t = left[i]
-        if t.isdigit():
-            try:
-                d = int(t)
-                if 1 <= d <= 31:
-                    d1 = d
-                    # si le token juste après est un mois → m1
-                    if i+1 < len(left):
-                        m1 = _month_from_token(left[i+1])
-                    break
-            except Exception:
-                pass
-
-    # droite : premier nombre = d2, puis le mois m2 (le premier mois après d2)
-    d2 = None; m2 = None; y2 = None
-    for i, t in enumerate(right):
-        if t.isdigit():
-            try:
-                d = int(t)
-                if 1 <= d <= 31:
-                    d2 = d
-                    # chercher un mois dans les 3 tokens suivants
-                    for j in range(i+1, min(i+4, len(right))):
-                        mm = _month_from_token(right[j])
-                        if mm:
-                            m2 = mm
-                            # année explicite si présente juste après
-                            if j+1 < len(right) and RX_YEAR.match(right[j+1] or ""):
-                                y2 = int(RX_YEAR.match(right[j+1]).group(1))
-                            break
-                    break
-            except Exception:
-                pass
-
-    if d1 is None or d2 is None or m2 is None:
-        return []
-
-    if m1 is None:
-        m1 = m2
-
-    if y2 is None:
-        y2 = _year_default(m2)
-    y1 = y2
-
-    return _expand_range(d1, m1, y1, d2, m2, y2)
-
-def _parse_simple_smart(s: str) -> str:
-    """
-    Dates simples possibles :
-      - "Samedi 27 septembre 2025"
-      - "sam. 27 sept."
-      - "27/09[/2025]"
-    Retourne "dd/mm/yyyy" ou "".
-    """
-    s = normalize_text(s or "")
-
-    # 1) numérique
-    m = RX_NUM.search(s)
-    if m:
-        try:
-            dd = int(m.group(1)); mm = int(m.group(2))
-            yy = int(m.group(3)) if m.group(3) else _year_default(mm)
-            if 1 <= dd <= 31 and 1 <= mm <= 12:
-                return f"{dd:02d}/{mm:02d}/{yy}"
-        except Exception:
-            pass
-
-    # 2) mots ("sam. 27 sept." / "27 septembre 2025" / avec jour)
-    toks = _tokenize(s)
-    # chercher un motif jourNumero + mois
-    for i, t in enumerate(toks):
-        if t.isdigit():
-            try:
-                dd = int(t)
-                if 1 <= dd <= 31:
-                    # mois peut être juste après ou à +1 (si un jour de la semaine est intercalé déjà pris en compte)
-                    for j in (i+1, i+2):
-                        if j < len(toks):
-                            mm = _month_from_token(toks[j])
-                            if mm:
-                                # année éventuelle
-                                yy = None
-                                if j+1 < len(toks) and RX_YEAR.match(toks[j+1] or ""):
-                                    yy = int(RX_YEAR.match(toks[j+1]).group(1))
-                                if yy is None:
-                                    yy = _year_default(mm)
-                                return f"{dd:02d}/{mm:02d}/{yy}"
-            except Exception:
-                pass
-    return ""
-
-# ---------------------------------------------------------------------------
-# Récupération du texte après le bloc gras (non-gras)
-def following_text_after(node) -> str:
+def _following_text_after(node) -> str:
+    """Texte non-gras qui suit le bloc gras (frères du parent), en retirant le séparateur en tête."""
     buff = []
     if node.next_sibling and isinstance(node.next_sibling, NavigableString):
         buff.append(str(node.next_sibling))
@@ -211,11 +81,89 @@ def following_text_after(node) -> str:
             buff.append(sib.get_text(" ", strip=True)); continue
         if isinstance(sib, NavigableString):
             buff.append(str(sib))
-    txt = " ".join([normalize_text(x) for x in buff if normalize_text(x)])
+    txt = " ".join([_norm_txt(x) for x in buff if _norm_txt(x)])
     txt = re.sub(r"^\s*[:—–\-]\s*", "", txt)
     return txt.strip()
 
-# ---------------------------------------------------------------------------
+
+def _parse_bold_date_exact(bold_txt: str):
+    """
+    Ne regarde QUE le contenu du bloc en gras.
+    Retourne (date_start, date_end) normalisées "dd/mm/yyyy" si l'année est explicite dans le gras.
+    Sinon, retourne ('','') pour ne pas inventer.
+    """
+    s = _norm_txt(bold_txt)
+
+    # 1) Plage dans le même bloc
+    m = RANGE_RX.match(s)
+    if m:
+        d1_s, m1_s, y1_s, d2_s, m2_s, y2_s = m.groups()
+        # jours
+        try:
+            d1 = int(re.sub(r"er$", "", d1_s or "", flags=re.IGNORECASE))
+            d2 = int(re.sub(r"er$", "", d2_s or "", flags=re.IGNORECASE))
+        except Exception:
+            return "", ""
+        # mois (m1 hérite de m2 si absent)
+        m2 = _month_from_token(m2_s)
+        m1 = _month_from_token(m1_s) if m1_s else m2
+        if not (m1 and m2):
+            return "", ""
+        # année : on n'utilise QUE ce qui est écrit dans le gras
+        y = y2_s or y1_s
+        if not y:
+            return "", ""
+        try:
+            y = int(y)
+        except Exception:
+            return "", ""
+        try:
+            start = date(y, m1, d1)
+            end   = date(y, m2, d2)
+            # si l'ordre est incohérent, on ne renvoie rien
+            if end < start:
+                return "", ""
+            return f"{start.day:02d}/{start.month:02d}/{start.year}", f"{end.day:02d}/{end.month:02d}/{end.year}"
+        except Exception:
+            return "", ""
+
+    # 2) Date simple "mots" dans le même bloc
+    m = SIMPLE_WORD_RX.match(s)
+    if m:
+        d_s, mon_s, y_s = m.groups()
+        try:
+            dd = int(re.sub(r"er$", "", d_s or "", flags=re.IGNORECASE))
+        except Exception:
+            return "", ""
+        mm = _month_from_token(mon_s)
+        if not mm:
+            return "", ""
+        if not y_s:
+            return "", ""   # pas d'année dans le gras → on ne crée pas de yyyy
+        try:
+            yy = int(y_s)
+            return f"{dd:02d}/{mm:02d}/{yy}", f"{dd:02d}/{mm:02d}/{yy}"
+        except Exception:
+            return "", ""
+
+    # 3) Date simple numérique "dd/mm[/yyyy]" dans le même bloc
+    m = SIMPLE_NUM_RX.match(s)
+    if m:
+        try:
+            dd = int(m.group(1)); mm = int(m.group(2))
+        except Exception:
+            return "", ""
+        y_s = m.group(3)
+        if not (1 <= dd <= 31 and 1 <= mm <= 12):
+            return "", ""
+        if not y_s:
+            return "", ""   # année non écrite → on ne fabrique pas
+        yy = int(y_s)
+        return f"{dd:02d}/{mm:02d}/{yy}", f"{dd:02d}/{mm:02d}/{yy}"
+
+    # rien de reconnu
+    return "", ""
+
 
 @bp.get("/infos-agenda")
 def infos_agenda():
@@ -226,75 +174,72 @@ def infos_agenda():
         html = fetch_html(SRC)
         soup = soup_from_html(html)
 
-        # nœuds "gras" (inclut <span style="font-weight:700">)
+        # nœuds en gras (inclut <span style="font-weight:700">)
         bold_nodes = list(soup.select("strong, b"))
         for sp in soup.find_all("span"):
             style = (sp.get("style") or "").lower()
-            if "font-weight" in style and any(w in style for w in ["700","bold"]):
+            if "font-weight" in style and any(w in style for w in ["700", "bold"]):
                 bold_nodes.append(sp)
 
         items, seen = [], set()
 
         for node in bold_nodes:
-            strong_txt = normalize_text(node.get_text(" ", strip=True))
+            strong_txt = _norm_txt(node.get_text(" ", strip=True))
             if not strong_txt:
                 continue
 
-            dates: list[str] = []
+            # ⇢ si le même bloc contient "date : titre", séparer
             desc_lower = ""
-
-            # Cas "date : titre" dans le même bloc
             parts = INLINE_SEP_RX.split(strong_txt, maxsplit=1)
             if len(parts) == 2:
-                date_part, desc_part = parts[0].strip(), parts[1].strip()
-                # 1) tenter plage
-                dates = _parse_range_smart(date_part)
-                # 2) sinon, date simple
-                if not dates:
-                    d = _parse_simple_smart(date_part)
-                    if d:
-                        dates = [d]
-                desc_lower = (desc_part or "").lower()
+                bold_date_part = parts[0].strip()
+                desc_lower = (parts[1] or "").lower()
+            else:
+                bold_date_part = strong_txt
 
-            # Si pas déterminé via split, essayer avec tout le bloc
-            if not dates:
-                # plage
-                dates = _parse_range_smart(strong_txt)
-            if not dates:
-                # simple
-                d = _parse_simple_smart(strong_txt)
-                if d:
-                    dates = [d]
+            # dates normalisées STRICTEMENT à partir du gras
+            date_start, date_end = _parse_bold_date_exact(bold_date_part)
 
-            # Si date mais pas de description, prendre le texte non-gras qui suit
-            if dates and not desc_lower:
-                tail = following_text_after(node)
+            # si pas de desc inline, prendre le non-gras qui suit
+            if not desc_lower:
+                tail = _following_text_after(node)
                 if tail:
                     desc_lower = tail.lower()
 
-            if not dates:
+            keyi = (bold_date_part, desc_lower[:220])
+            if keyi in seen:
                 continue
+            seen.add(keyi)
 
-            # Émettre une entrée par date
-            for dd in dates:
-                keyi = (dd, desc_lower[:200])
-                if keyi in seen:
-                    continue
-                seen.add(keyi)
-                items.append({
-                    "date": dd,
-                    "date_spoken": ddmmyyyy_to_spoken(dd),
-                    "texte": desc_lower,
-                    "source_bloc": strong_txt  # utile au debug; supprime si tu ne veux pas l'exposer
-                })
+            item = {
+                # EXACTEMENT ce qui est écrit en gras :
+                "date_bold": bold_date_part,
+                # Texte associé en minuscules :
+                "texte": desc_lower,
+                # Normalisations (uniquement si l'année est explicitement écrite dans le gras) :
+                "date_start": date_start,   # "" si inconnue
+                "date_end": date_end,       # "" si inconnue
+                # Optionnel utile debug :
+                "source_bloc": strong_txt
+            }
 
-        # Tri par date croissante
+            # Confort : si c'est une date simple (start==end non vide), on ajoute un parlé
+            if date_start and date_end and date_start == date_end:
+                item["date_spoken"] = ddmmyyyy_to_spoken(date_start)
+            else:
+                item["date_spoken"] = ""
+
+            items.append(item)
+
+        # Tri : si date_start existe on trie dessus, sinon on laisse en ordre d'apparition
         def k(e):
+            ds = e.get("date_start") or ""
             try:
-                d, m, y = e["date"].split("/")
-                return (int(y), int(m), int(d))
+                d, m, y = ds.split("/")
+                return (0, int(y), int(m), int(d))
             except Exception:
-                return (9999, 12, 31)
+                return (1, 9999, 12, 31)
+
         items.sort(key=k)
 
         payload = {
