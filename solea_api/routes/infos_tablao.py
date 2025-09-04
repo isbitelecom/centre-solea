@@ -2,7 +2,7 @@
 from flask import Blueprint, jsonify, request
 import re
 import unicodedata
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from urllib.parse import urljoin
 from bs4 import NavigableString
 
@@ -39,13 +39,14 @@ def infos_tablao():
 
         page_text = norm(soup.get_text("\n", strip=True))
 
-        # ===== Saison pour inférence d'année =====
+        # ===== Saison pour inférence d'année (sinon année courante) =====
         season_years = []
         m_season = re.search(r"\b(20\d{2})\s*[-/]\s*(20\d{2})\b", page_text or "")
         if m_season:
             season_years = [int(m_season.group(1)), int(m_season.group(2))]
+        CUR_YEAR = datetime.now().year
 
-        # ===== Mois (plein + abréviations, avec/ sans accents/points/MAJ) =====
+        # ===== Mois (plein + abréviations, avec/sans accents/points) =====
         MOIS_FULL = {
             "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
             "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
@@ -53,25 +54,24 @@ def infos_tablao():
         }
         MOIS_ABBR = {
             "jan": 1, "janv": 1,
-            "fev": 2, "fevr": 2, "fevr": 2, "fev.": 2, "fév": 2, "fév.": 2,
+            "fev": 2, "fevr": 2, "fév": 2,
             "mar": 3,
             "avr": 4,
             "mai": 5,
-            "jun": 6, "juin": 6,  # au cas où
-            "jul": 7, "juil": 7, "juil.": 7,
-            "aou": 8, "aoû": 8, "août": 8, "aout": 8,
-            "sep": 9, "sept": 9, "sept.": 9,
-            "oct": 10, "oct.": 10,
-            "nov": 11, "nov.": 11,
-            "dec": 12, "déc": 12, "déc.": 12, "dec.": 12,
+            "jun": 6, "juin": 6,
+            "jul": 7, "juil": 7,
+            "aou": 8, "aoû": 8, "aout": 8, "août": 8,
+            "sep": 9, "sept": 9,
+            "oct": 10,
+            "nov": 11,
+            "dec": 12, "déc": 12
         }
-        # regex “mots mois” large
         MONTH_WORD_GROUP = (
             r"janvier|janv\.?|février|fevrier|févr\.?|fevr\.?|mars|avril|avr\.?|mai|juin|"
             r"juillet|juil\.?|août|aout|septembre|sept\.?|octobre|oct\.?|novembre|nov\.?|"
             r"décembre|decembre|déc\.?|dec\.?"
         )
-        JOURS = r"(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)"
+        JOURS = r"(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|lun\.?|mar\.?|mer\.?|jeu\.?|ven\.?|sam\.?|dim\.?)"
 
         DATE_RX_WORDS = re.compile(
             rf"(?:(?:du|le|les)?\s*)?(?:{JOURS}\s+)?"
@@ -95,7 +95,8 @@ def infos_tablao():
             if season_years:
                 y1, y2 = season_years  # sept–déc -> y1 ; jan–août -> y2
                 return y1 if month_num >= 9 else y2
-            return None
+            # défaut: année courante
+            return CUR_YEAR
 
         def month_from_token(tok: str) -> int:
             if not tok:
@@ -105,12 +106,6 @@ def infos_tablao():
                 return MOIS_FULL[t]
             if t in MOIS_ABBR:
                 return MOIS_ABBR[t]
-            # formes 3 lettres maj (“OCT”, “NOV”, “DEC”)
-            if re.fullmatch(r"(jan|fev|mar|avr|mai|jun|jul|aou|sep|oct|nov|dec)", t):
-                return {
-                    "jan": 1, "fev": 2, "mar": 3, "avr": 4, "mai": 5, "jun": 6,
-                    "jul": 7, "aou": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-                }[t]
             return 0
 
         def to_ddmmyyyy_from_words(day_s: str, month_s: str, year_s: str | None) -> str:
@@ -190,121 +185,70 @@ def infos_tablao():
                     seen_d.add(d); uniq.append(d)
             return uniq
 
-        # ====== DOM: extraire dates éclatées autour du titre ======
-        def collect_tokens_around(node, up_levels=3, forward_siblings=8):
+        # ====== Contexte large autour du titre ======
+        def gather_context_text(node, up_levels=4, prev_siblings=6, next_siblings=6):
             """
-            Remonte jusqu'à un conteneur raisonnable, puis collecte:
-             - textes descendants (chaque petit span)
-             - textes des frères suivants (quelques pas)
-             - attributs utiles: datetime, title, aria-label
+            Remonte jusqu'à un conteneur "carte", puis récupère:
+             - tout le texte descendant (incluant petits <span>)
+             - texte des frères *précédents* et *suivants* (±N)
+             - attributs utiles (time[datetime], aria-label, title, data-*)
             """
             # remonter
             anc = node
-            for _ in range(up_levels):
-                if not anc.parent:
-                    break
+            levels = 0
+            while anc.parent is not None and levels < up_levels:
                 anc = anc.parent
-                # heuristique: si ce conteneur contient <time> ou beaucoup de petits spans, on s'arrête
-                if getattr(anc, "find", None) and (anc.find("time") or len(list(anc.find_all("span"))) >= 3):
+                levels += 1
+                # heuristique d'arrêt si le conteneur est dense (beaucoup de spans ou présence de <time>)
+                try:
+                    if anc.find("time") or len(list(anc.find_all("span"))) >= 3:
+                        break
+                except Exception:
                     break
 
-            tokens = []
-            def push_token(s):
+            pieces = []
+
+            def push(s):
                 s = norm(s)
                 if s:
-                    tokens.append(s)
+                    pieces.append(s)
 
-            # descendants (texte de petits spans)
-            if getattr(anc, "find_all", None):
-                for el in anc.find_all(True, limit=120):
-                    # time tag
+            # descendants + attributs
+            if hasattr(anc, "find_all"):
+                for el in anc.find_all(True, limit=300):
+                    # <time>
                     if el.name == "time":
                         dt = el.get("datetime")
-                        if dt: push_token(dt)
-                    # attributs utiles
+                        if dt: push(dt)
                     for attr in ("aria-label", "title", "data-title", "data-date", "data-datetime"):
                         v = el.get(attr)
-                        if v: push_token(v)
-                    # texte
+                        if v: push(v)
                     txt = el.get_text(" ", strip=True)
-                    push_token(txt)
+                    push(txt)
 
-            # quelques frères suivants du parent direct du titre
-            parent = node.parent or node
-            steps = 0
-            for sib in getattr(parent, "next_siblings", []):
-                if steps >= forward_siblings: break
-                steps += 1
-                if hasattr(sib, "get_text"):
-                    push_token(sib.get_text(" ", strip=True))
-                elif isinstance(sib, NavigableString):
-                    push_token(str(sib))
+            # frères précédents
+            psteps = 0
+            for ps in getattr(anc, "previous_siblings", []):
+                if psteps >= prev_siblings: break
+                psteps += 1
+                if hasattr(ps, "get_text"):
+                    push(ps.get_text(" ", strip=True))
+                elif isinstance(ps, NavigableString):
+                    push(str(ps))
 
-            return tokens
+            # frères suivants
+            nsteps = 0
+            for ns in getattr(anc, "next_siblings", []):
+                if nsteps >= next_siblings: break
+                nsteps += 1
+                if hasattr(ns, "get_text"):
+                    push(ns.get_text(" ", strip=True))
+                elif isinstance(ns, NavigableString):
+                    push(str(ns))
 
-        NUM_RX = re.compile(r"^\d{1,2}$")
-        YEAR_RX = re.compile(r"^(20\d{2})$")
+            return "\n".join(pieces)
 
-        def dates_from_tokens(tokens):
-            out = []
-            # 1) tout texte “classique”
-            big_text = " \n ".join(tokens)
-            out.extend(any_date_in(big_text))
-            # 2) reconstruction “jour + mois (+ année)” en tokens consécutifs
-            for i in range(len(tokens)-1):
-                a, b = tokens[i], tokens[i+1]
-                if NUM_RX.match(a) and month_from_token(b):
-                    dd = int(a)
-                    mm = month_from_token(b)
-                    yy = None
-                    if i+2 < len(tokens) and YEAR_RX.match(tokens[i+2]):
-                        yy = int(tokens[i+2])
-                    else:
-                        yy = infer_year(mm, None)
-                    if 1 <= dd <= 31 and mm and yy:
-                        out.append(f"{dd:02d}/{mm:02d}/{yy}")
-                # plage: “11 … au 12 OCT”
-                if NUM_RX.match(a) and tokens[i+1].lower() == "au":
-                    # chercher “12”, puis mois
-                    if i+2 < len(tokens) and NUM_RX.match(tokens[i+2]):
-                        dd1 = int(a); dd2 = int(tokens[i+2])
-                        # mois après (ou avant)
-                        mm = 0
-                        # après
-                        if i+3 < len(tokens):
-                            mm = month_from_token(tokens[i+3])
-                        # sinon, tenter le mois juste avant
-                        if mm == 0 and i-1 >= 0:
-                            mm = month_from_token(tokens[i-1])
-                        if mm:
-                            yy1 = infer_year(mm, None)
-                            yy2 = yy1
-                            if yy1 and yy2:
-                                # étendre la plage
-                                try:
-                                    start = date(yy1, mm, dd1)
-                                    end = date(yy2, mm, dd2)
-                                    cur = start
-                                    while cur <= end:
-                                        out.append(f"{cur.day:02d}/{cur.month:02d}/{cur.year}")
-                                        cur += timedelta(days=1)
-                                except Exception:
-                                    pass
-            # uniq
-            seen, uniq = set(), []
-            for d in out:
-                if d not in seen:
-                    seen.add(d); uniq.append(d)
-            return uniq
-
-        def extract_lieu(txt: str) -> str:
-            t = nz(txt)
-            parts = re.split(r"\s+(?:-|—|–|@)\s+", t)
-            if len(parts) >= 2:
-                return parts[-1].strip()
-            return ""
-
-        # ====== Détail ======
+        # ====== Détail (fallback) ======
         def parse_detail(url: str):
             try:
                 h = fetch_html(url)
@@ -314,6 +258,7 @@ def infos_tablao():
                 return [], "", ""
             dates = any_date_in(txt)
             hr = nz(extract_time_from_text(txt))
+            # Lieu: heuristique: une ligne ressemblant à une adresse/localité
             lieu = ""
             for line in re.split(r"\n+", txt or ""):
                 if re.search(r"(Marseille|Rue|France|130\d{2})", line or "", re.IGNORECASE):
@@ -327,21 +272,21 @@ def infos_tablao():
                 a = getattr(node, "find", lambda *_: None)("a")
                 if a and a.get("href"):
                     return urljoin(BASE, nz(a.get("href")))
+                # explorer quelques frères du parent du titre
                 parent = node.parent or node
-                # scrute quelques frères
                 steps = 0
                 for sib in parent.next_siblings:
                     steps += 1
-                    if steps > 8: break
+                    if steps > 10: break
                     if getattr(sib, "name", "") and hasattr(sib, "select"):
                         for cand in sib.select("a"):
                             href = nz(cand.get("href"))
                             if href:
                                 return urljoin(BASE, href)
-                # scrute ancêtres
+                # explorer des ancêtres
                 anc = node.parent
                 depth = 0
-                while getattr(anc, "select", None) and depth < 4:
+                while getattr(anc, "select", None) and depth < 5:
                     depth += 1
                     for cand in anc.select("a"):
                         href = nz(cand.get("href"))
@@ -367,16 +312,22 @@ def infos_tablao():
         for node in title_nodes:
             title = norm(node.get_text(" ", strip=True)) or "Tablao"
 
-            # 1) extraire autour du titre (tokens éclatés, <time>, attributs…)
-            tokens = collect_tokens_around(node)
-            dates = dates_from_tokens(tokens)
+            # 1) Contexte large (inclut “sam. 27 sept.” même éclaté)
+            ctx = gather_context_text(node, up_levels=4, prev_siblings=6, next_siblings=6)
+            dates = any_date_in(ctx)
+            hr = nz(extract_time_from_text(ctx))
+            # Lieu simple: après un tiret / avant-dernier segment
+            def extract_lieu(txt: str) -> str:
+                t = nz(txt)
+                parts = re.split(r"\s+(?:-|—|–|@)\s+", t)
+                if len(parts) >= 2:
+                    return parts[-1].strip()
+                # sinon, ville en clair
+                mcity = re.search(r"\b(Marseille|Aix|Nice|Lyon|Toulouse|Paris)\b", t, re.IGNORECASE)
+                return mcity.group(1) if mcity else ""
+            lieu = extract_lieu(ctx)
 
-            # 2) texte “local” pour heure / lieu
-            local_text = " \n ".join(tokens)
-            hr = nz(extract_time_from_text(local_text))
-            lieu = extract_lieu(local_text)
-
-            # 3) fallback : page détail si pas de date
+            # 2) fallback: page de détails si pas de date
             if not dates:
                 href = find_related_href(node)
                 if href:
@@ -388,7 +339,7 @@ def infos_tablao():
             titre_norm = sanitize_for_voice(title)
             lieu_norm = sanitize_for_voice(lieu)
 
-            # 4) si toujours pas de date, on garde quand même l'info (date vide) — à enlever si tu veux filtrer
+            # 3) si toujours pas de date, on garde l’info (date vide) OU on peut "continue" si tu veux uniquement des dated
             if not dates:
                 k = ("", titre_norm.lower()[:160], hr)
                 if k not in seen:
@@ -404,7 +355,7 @@ def infos_tablao():
                     })
                 continue
 
-            # 5) une entrée par date
+            # 4) une entrée par date
             for dd in dates:
                 k = (dd, titre_norm.lower()[:160], hr)
                 if k in seen: continue
