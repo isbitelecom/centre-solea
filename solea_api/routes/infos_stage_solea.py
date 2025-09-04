@@ -22,32 +22,36 @@ RE_NUM    = re.compile(r"(?i)\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b"
 RE_PRICE_ANY = re.compile(r"€")
 RE_TARIF_CAT = re.compile(r"(?i)\b(adh[ée]rents?|non\s*adh[ée]rents?|[ée]l[eè]ves?)\b[^0-9]{0,20}([0-9 ][0-9 ]*)\s*€")
 
+
 def detect_date_block(s: str):
     # du X au Y mois [année]
     m = RE_RANGE.search(s)
     if m:
         d1, d2 = m.group(1), m.group(2)
-        mon = m.group(3)  # 'oct' / 'oct.' / 'octobre'
+        mon_txt = m.group(3)  # ex: 'oct', 'oct.', 'octobre'
         y = m.group(4)
         y = int(y) if y else None
+        mon = month_to_int_any(mon_txt)  # <-- conversion des mois texte → entier
         return fmt_date(y, mon, d1), fmt_date(y, mon, d2)
 
     # "12 et 13 mois [année]"
     m = RE_DUO.search(s)
     if m:
         d1, d2 = m.group(1), m.group(2)
-        mon = m.group(3)
+        mon_txt = m.group(3)
         y = m.group(4)
         y = int(y) if y else None
+        mon = month_to_int_any(mon_txt)
         return fmt_date(y, mon, d1), fmt_date(y, mon, d2)
 
     # "12 mois [année?]"
     m = RE_SINGLE.search(s)
     if m:
         d = m.group(1)
-        mon = m.group(2)
+        mon_txt = m.group(2)
         y = m.group(3)
         y = int(y) if y else None
+        mon = month_to_int_any(mon_txt)
         return fmt_date(y, mon, d), ""
 
     # "12/10[/2024]" etc.
@@ -57,9 +61,11 @@ def detect_date_block(s: str):
         y = int(yy) if yy else None
         if y is not None and y < 100:
             y += 2000
-        return fmt_date(y, mo, d), ""
+        # mo est numérique (1-12) : on le cast en int par cohérence
+        return fmt_date(y, int(mo), d), ""
 
     return "", ""
+
 
 @bp.get("/infos-stage-solea")
 def infos_stage_solea():
