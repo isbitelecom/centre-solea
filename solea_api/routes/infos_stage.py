@@ -2,12 +2,15 @@
 from flask import Blueprint, jsonify
 import re
 import requests
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 bp = Blueprint("infos_stage", __name__)
 SRC = "https://www.centresolea.org/stages"
+TZ = ZoneInfo("Europe/Madrid")
 
-# ---------------- Helpers locaux ----------------
+# ---------------- Utils texte ----------------
 def normalize_text(s: str) -> str:
     if not s:
         return ""
@@ -23,7 +26,7 @@ def safe_int(x, default=None):
     except Exception:
         return default
 
-# Mois FR
+# ---------------- Mois & dates ----------------
 MONTHS_FR = {
     "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
     "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
@@ -45,6 +48,13 @@ def month_to_int_any(m):
         return v if v and 1 <= v <= 12 else None
     return MONTHS_FR.get(s)
 
+def infer_school_year_for_month(mon: int) -> int:
+    """Année scolaire: sept->août = année en cours; janv-août = année suivante si on est déjà ≥ sept."""
+    now = datetime.now(TZ)
+    if mon >= 9:
+        return now.year
+    return now.year + 1 if now.month >= 9 else now.year
+
 def fmt_date(y, m, d) -> str:
     mi = month_to_int_any(m)
     if not mi:
@@ -53,26 +63,54 @@ def fmt_date(y, m, d) -> str:
     if di is None:
         return ""
     yi = safe_int(y)
-    return f"{di:02d}/{mi:02d}/{(yi if yi else 0):04d}".replace("/0000", "")
+    if yi is None:
+        yi = infer_school_year_for_month(mi)
+    return f"{di:02d}/{mi:02d}/{yi:04d}"
 
-def ddmmyyyy_to_spoken_local(ddmmyyyy: str) -> str:
+def spoken_date(ddmmyyyy: str) -> str:
+    """'12/10/2025' -> '12 octobre 2025' ; tolère 2 ou 3 segments."""
     if not ddmmyyyy:
         return ""
-    try:
-        d, m, y = ddmmyyyy.split("/")
-        d_int = safe_int(d)
-        if d_int is None:
+    parts = ddmmyyyy.split("/")
+    if len(parts) == 2:  # d/m -> on infère l'année scolaire
+        d, m = parts
+        m_int = safe_int(m) or month_to_int_any(m)
+        if not m_int:
             return ddmmyyyy
-        m_int = safe_int(m) if str(m).isdigit() else month_to_int_any(m)
-        if not m_int or not (1 <= m_int <= 12):
-            return ddmmyyyy
-        names = ["","janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"]
-        return f"{d_int} {names[m_int]} {y}" if y else f"{d_int} {names[m_int]}"
-    except Exception:
+        y = infer_school_year_for_month(m_int)
+        parts = [d, str(m_int), str(y)]
+    if len(parts) != 3:
         return ddmmyyyy
+    d, m, y = parts
+    d_i, m_i, y_i = safe_int(d), safe_int(m), safe_int(y)
+    if not d_i or not m_i:
+        return ddmmyyyy
+    names = ["","janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"]
+    return f"{d_i} {names[m_i]} {y_i}" if y_i else f"{d_i} {names[m_i]}"
 
-# Heures → vocal
-RE_HOUR = re.compile(r"\b(\d{1,2})\s*[:h]\s*([0-5]?\d)?\b")
+# ---------------- Heures ----------------
+RE_HRANGE_1 = re.compile(r"\b(\d{1,2})\s*h\s*([0-5]?\d)?\s*[-–—]\s*(\d{1,2})\s*h\s*([0-5]?\d)?\b")
+RE_HRANGE_2 = re.compile(r"\b(\d{1,2})\s*:\s*([0-5]?\d)\s*[-–—/]\s*(\d{1,2})\s*:\s*([0-5]?\d)\b")
+RE_HSINGLE  = re.compile(r"\b(\d{1,2})\s*[:h]\s*([0-5]?\d)?\b")
+
+def heures_from_line(line: str) -> list[str]:
+    out = []
+    for m in RE_HRANGE_1.finditer(line):
+        h1, m1, h2, m2 = m.groups()
+        seg = f"{int(h1)}h{int(m1):02d}" if m1 else f"{int(h1)}h"
+        seg += " - "
+        seg += f"{int(h2)}h{int(m2):02d}" if m2 else f"{int(h2)}h"
+        out.append(seg)
+    for m in RE_HRANGE_2.finditer(line):
+        h1, m1, h2, m2 = m.groups()
+        out.append(f"{int(h1)}h{int(m1):02d} - {int(h2)}h{int(m2):02d}")
+    # éviter de rajouter des simples si un range est déjà présent sur la même ligne
+    if not out:
+        for m in RE_HSINGLE.finditer(line):
+            h, mn = m.groups()
+            out.append(f"{int(h)}h{int(mn):02d}" if mn else f"{int(h)}h")
+    return out
+
 def heure_vocale(s: str) -> str:
     def repl(m):
         h = safe_int(m.group(1), 0)
@@ -80,9 +118,9 @@ def heure_vocale(s: str) -> str:
         if not mn or re.fullmatch(r"0+", mn):
             return f"{h} heures"
         return f"{h} heures {safe_int(mn, 0)}"
-    return RE_HOUR.sub(repl, s)
+    return RE_HSINGLE.sub(repl, s)
 
-# J espagnol → jota
+# ---------------- “Jota” pour TTS ----------------
 SPANISH_J = {"jaleo","jaleos","cajon","cajón","jesus","jesús","jose","josé","juan","jota","jerez"}
 def jotaize_word(w: str) -> str:
     base = (
@@ -98,31 +136,29 @@ def tts_jota(text: str) -> str:
     tokens = re.split(r"(\W+)", text or "")
     return "".join(jotaize_word(tok) if re.match(r"\w+", tok) else tok for tok in tokens)
 
-# ---------------- Regex extraction ----------------
-RE_RANGE  = re.compile(rf"(?i)\bdu\s+(\d{{1,2}})\s+au\s+(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?")
-RE_DUO    = re.compile(rf"(?i)\b(\d{{1,2}})\s+et\s+(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?")
-RE_SINGLE = re.compile(rf"(?i)\b(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?\b")
-RE_NUM    = re.compile(r"(?i)\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b")
-RE_ANYDATE = re.compile(
-    rf"(?i)\b(?:du\s+\d{{1,2}}\s+au\s+\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?"
-    rf"|\d{{1,2}}\s+et\s+\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?"
-    rf"|\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?"
-    rf"|\d{{1,2}}[\/\-.]\d{{1,2}}(?:[\/\-.]\d{{2,4}})?)\b"
-)
-
+# ---------------- Détection contenu ----------------
 KEYWORDS = re.compile(r"(?i)\b(master\s*-?\s*class|masterclass|stage[s]?|atelier\s+d[’']immersion|atelier[s]?)\b")
 RE_PRICE_ANY = re.compile(r"€")
 RE_TARIF_LINE = re.compile(r"(?i)\b(adh[ée]rents?|non\s*adh[ée]rents?|[ée]l[eè]ves?|élèves?|eleves?)\b.*?\d+\s*€")
 
-# bruit
+RE_RANGE  = re.compile(rf"(?i)\bdu\s+(\d{{1,2}})\s+au\s+(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?")
+RE_DUO    = re.compile(rf"(?i)\b(\d{{1,2}})\s+et\s+(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?")
+RE_SINGLE = re.compile(rf"(?i)\b(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?\b")
+RE_NUM    = re.compile(r"(?i)\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b")
+
+# Bruit dur (menus, footer, accessibilité, etc.)
 RE_NOISE = re.compile(
-    r"(?i)^(l'?ecole|les cours|horaires(?: et tarifs)?|tarifs$|le lieu|infos ?/ ?contact|newsletter|suivez(-| )?nous|agenda 20|événements? ?(à|a) venir|solea productions|les compagnies|festival flamenco azul)$"
+    r"(?i)^(top of page|bottom of page|use tab to navigate|newsletter|abonnez vous|centre solea -|suivez(-| )?nous|"
+    r"l'?ecole de danse|les cours|horaires(?: et tarifs)?|le lieu|infos ?/ ?contact|agenda 20|"
+    r"événements? ?(à|a) venir|solea productions|les compagnies|festival flamenco azul)$"
 )
+
 def is_noise(line: str) -> bool:
     if not line:
         return True
-    if RE_NOISE.match(line):
+    if RE_NOISE.match(line.strip()):
         return True
+    # Entêtes tout en majuscules très courts
     if len(line) <= 30 and re.fullmatch(r"[A-ZÉÈÀÙÂÊÎÔÛÄËÏÖÜÇ0-9 \-'/]+", line):
         return True
     return False
@@ -161,13 +197,6 @@ def detect_date_block(s: str):
         return fmt_date(y, safe_int(mo), d), ""
     return "", ""
 
-def strip_date_from(text: str) -> str:
-    m = RE_ANYDATE.search(text or "")
-    if not m:
-        return text
-    out = (text[:m.start()] + text[m.end():]).strip(" ,;:.-")
-    return normalize_text(out)
-
 def extract_lines(html: str):
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script","style","noscript","iframe","svg"]):
@@ -177,7 +206,7 @@ def extract_lines(html: str):
         t = normalize_text(el.get_text(" ", strip=True))
         if t:
             lines.append(t)
-    # dédoublonner les suites identiques
+    # dédoublonner immédiat
     dedup, prev = [], None
     for t in lines:
         if t != prev:
@@ -198,77 +227,118 @@ def infos_stage():
 
         for raw in lines:
             line = raw.strip()
+
             if is_noise(line):
                 continue
 
-            header_hit = KEYWORDS.search(line) or RE_ANYDATE.search(line)
-            if header_hit:
-                if current and (current.get("titre") or current.get("date") or current.get("tarifs") or current.get("heures")):
-                    if current.get("titre"):
-                        current["titre_vocal"] = tts_jota(current["titre"])
+            # Démarrage d'un nouveau bloc UNIQUEMENT sur mot-clé
+            if KEYWORDS.search(line):
+                # Finaliser le précédent si non vide
+                if current and any([current.get("date"), current.get("date_fin"),
+                                    current["heures"], current["tarifs"], current.get("description")]):
+                    current["titre_vocal"] = tts_jota(current.get("titre",""))
                     if current.get("description"):
                         current["description_vocal"] = tts_jota(heure_vocale(current["description"]))
+                    # vocaliser les heures (élément par élément)
+                    current["heures_vocal"] = [heure_vocale(h) for h in current["heures"]]
+                    # date_spoken propre
+                    if current.get("date") and current.get("date_fin"):
+                        current["date_spoken"] = f"du {spoken_date(current['date'])} au {spoken_date(current['date_fin'])}"
+                    elif current.get("date"):
+                        current["date_spoken"] = spoken_date(current["date"])
                     items.append(current)
 
+                # Nouveau bloc
                 d1, d2 = detect_date_block(line)
-                titre = strip_date_from(line)
+                titre = line
+                # si la date est sur la même ligne, l’enlever du titre
+                if d1 or d2:
+                    # retirer le premier motif de date de la ligne
+                    titre = re.sub(rf"(?i)\bdu\s+\d{{1,2}}\s+au\s+\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?\b", "", titre)
+                    titre = re.sub(rf"(?i)\b\d{{1,2}}\s+et\s+\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?\b", "", titre)
+                    titre = re.sub(rf"(?i)\b\d{{1,2}}\s+{MONTH_WORD}(?:\s+\d{{4}})?\b", "", titre)
+                    titre = re.sub(r"(?i)\b\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?\b", "", titre)
+                    titre = titre.strip(" ,;:.-")
+
                 typ = classify_type(titre or line)
-
-                if titre and titre.lower() in {"stages", "atelier", "ateliers", "master class", "masterclass"} and not (d1 or d2):
-                    current = None
-                    continue
-
                 current = {
-                    "type": typ if typ != "evenement" else ("stage" if "stage" in line.lower() else typ),
-                    "titre": titre if titre else None,
+                    "type": typ,
+                    "titre": titre[:240] if titre else typ.title(),
                     "date": d1,
                     "date_fin": d2,
-                    "date_spoken": (f"du {ddmmyyyy_to_spoken_local(d1)} au {ddmmyyyy_to_spoken_local(d2)}" if d1 and d2
-                                    else (ddmmyyyy_to_spoken_local(d1) if d1 else "")),
+                    "date_spoken": "",
                     "heures": [],
+                    "heures_vocal": [],
                     "tarifs": [],
-                    "description": ""
+                    "description": "",
+                    "sessions": []  # dates additionnelles (listes type "21 septembre", etc.)
                 }
-                if not current["titre"] and (d1 or d2):
-                    current["titre"] = "Programme"
                 continue
 
+            # Si pas de bloc en cours, ignorer la ligne
             if not current:
                 continue
 
-            if re.search(r"\d{1,2}\s*[:h]\s*[0-5]?\d?", line):
-                hv = heure_vocale(line)
-                if hv not in current["heures"]:
-                    current["heures"].append(hv)
+            # Dans un bloc : chercher dates → remplir ou pousser en sessions
+            d1, d2 = detect_date_block(line)
+            if d1 or d2:
+                if not current["date"]:
+                    current["date"] = d1
+                elif not current["date_fin"] and d2:
+                    current["date_fin"] = d2
+                else:
+                    # dates additionnelles (sessions)
+                    if d2:
+                        current["sessions"].append({"date": d1, "date_fin": d2})
+                    else:
+                        current["sessions"].append({"date": d1})
                 continue
 
-            if RE_TARIF_LINE.search(line) or RE_PRICE_ANY.search(line):
+            # Heures → en petites unités propres
+            hrs = heures_from_line(line)
+            if hrs:
+                for h in hrs:
+                    if h not in current["heures"]:
+                        current["heures"].append(h)
+                continue
+
+            # Tarifs
+            if RE_TARIF_LINE.search(line) or (RE_PRICE_ANY.search(line) and len(line) < 220):
                 if line not in current["tarifs"]:
                     current["tarifs"].append(line)
                 continue
 
+            # Description
             if not is_noise(line):
-                if current["description"]:
-                    if len(current["description"]) < 800:
-                        current["description"] += " " + line
-                else:
-                    current["description"] = line
+                if len(current["description"]) < 1000:
+                    current["description"] = (current["description"] + " " + line).strip()
 
-        if current and (current.get("titre") or current.get("date") or current.get("tarifs") or current.get("heures")):
+        # Finaliser le dernier bloc
+        if current and any([current.get("date"), current.get("date_fin"),
+                            current["heures"], current["tarifs"], current.get("description")]):
             current["titre_vocal"] = tts_jota(current.get("titre",""))
-            current["description_vocal"] = tts_jota(heure_vocale(current.get("description","")))
+            if current.get("description"):
+                current["description_vocal"] = tts_jota(heure_vocale(current["description"]))
+            current["heures_vocal"] = [heure_vocale(h) for h in current["heures"]]
+            if current.get("date") and current.get("date_fin"):
+                current["date_spoken"] = f"du {spoken_date(current['date'])} au {spoken_date(current['date_fin'])}"
+            elif current.get("date"):
+                current["date_spoken"] = spoken_date(current["date"])
             items.append(current)
 
-        cleaned, seen = [], set()
+        # Nettoyage / filtrage final
+        cleaned = []
+        seen = set()
         for it in items:
-            if not any([it.get("titre"), it.get("date"), it.get("tarifs"), it.get("heures")]):
+            # garder seulement les blocs avec type reconnu ET (date|heures|tarifs)
+            if it["type"] not in {"stage","master class","atelier","atelier d'immersion","evenement"}:
                 continue
-            key = (it.get("type",""), (it.get("titre") or "")[:140], it.get("date",""), it.get("date_fin",""))
+            if not (it.get("date") or it.get("date_fin") or it["heures"] or it["tarifs"]):
+                continue
+            key = (it["type"], it.get("titre","")[:160], it.get("date",""), it.get("date_fin",""))
             if key in seen:
                 continue
             seen.add(key)
-            if not it.get("titre") and it.get("description"):
-                it["titre"] = it["description"][:120]
             cleaned.append(it)
 
         return jsonify({"source": SRC, "count": len(cleaned), "items": cleaned})
