@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 bp = Blueprint("infos_stage", __name__)
 SRC = "https://www.centresolea.org/stages"
 
-# ---------------- Helpers locaux (pas d'import externe) ----------------
+# ---------------- Helpers locaux (aucun import externe) ----------------
 def normalize_text(s: str) -> str:
     if not s:
         return ""
@@ -17,6 +17,7 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+# Mois FR
 MONTHS_FR = {
     "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
     "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
@@ -46,7 +47,7 @@ def fmt_date(y, m, d) -> str:
         di = int(d)
     except Exception:
         return ""
-    yi = int(y) if y else None
+    yi = int(y) if (y is not None and str(y).isdigit()) else None
     return f"{di:02d}/{mi:02d}/{(yi if yi else 0):04d}".replace("/0000", "")
 
 def ddmmyyyy_to_spoken_local(ddmmyyyy: str) -> str:
@@ -55,7 +56,7 @@ def ddmmyyyy_to_spoken_local(ddmmyyyy: str) -> str:
     try:
         d, m, y = ddmmyyyy.split("/")
         d_int = int(d)
-        m_int = int(m) if m.isdigit() else month_to_int_any(m)
+        m_int = int(m) if str(m).isdigit() else month_to_int_any(m)
         if not m_int or not (1 <= m_int <= 12):
             return ddmmyyyy
         names = ["","janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"]
@@ -64,7 +65,7 @@ def ddmmyyyy_to_spoken_local(ddmmyyyy: str) -> str:
         return ddmmyyyy
 
 # Heures → vocal (“20h00” → “20 heures”, “16:30” → “16 heures 30”)
-RE_HOUR = re.compile(r"\b(\d{1,2})\s*[h:]\s*([0-5]?\d)?\b")
+RE_HOUR = re.compile(r"\b(\d{1,2})\s*[:h]\s*([0-5]?\d)?\b")
 def heure_vocale(s: str) -> str:
     def repl(m):
         h = int(m.group(1))
@@ -74,12 +75,29 @@ def heure_vocale(s: str) -> str:
         return f"{h} heures {int(mn)}"
     return RE_HOUR.sub(repl, s)
 
-def strip_date_from(text: str) -> str:
-    m = RE_ANYDATE.search(text or "")
-    if not m:
-        return text
-    out = (text[:m.start()] + text[m.end():]).strip(" ,;:.-")
-    return normalize_text(out)
+# Prononciation “Jota” (J espagnol)
+SPANISH_J = {"jaleo","jaleos","cajon","cajón","jesus","jesús","jose","josé","juan","jota","jerez"}
+def jotaize_word(w: str) -> str:
+    base = (
+        w.lower()
+        .replace("á","a").replace("é","e").replace("í","i")
+        .replace("ó","o").replace("ú","u").replace("ü","u").replace("ñ","n")
+    )
+    if base in SPANISH_J or any(base.startswith(x) for x in ("jaleo","cajon","jesu","jose","juan","jota","jerez")):
+        out = []
+        for ch in w:
+            if ch == "j":
+                out.append("kh")
+            elif ch == "J":
+                out.append("Kh")
+            else:
+                out.append(ch)
+        return "".join(out)
+    return w
+
+def tts_jota(text: str) -> str:
+    tokens = re.split(r"(\W+)", text or "")
+    return "".join(jotaize_word(tok) if re.match(r"\w+", tok) else tok for tok in tokens)
 
 # ---------------- Regex extraction ----------------
 RE_RANGE  = re.compile(rf"(?i)\bdu\s+(\d{{1,2}})\s+au\s+(\d{{1,2}})\s+({MONTH_WORD})(?:\s+(\d{{4}}))?")
@@ -93,7 +111,9 @@ RE_PRICE_ANY = re.compile(r"€")
 RE_TARIF_LINE = re.compile(r"(?i)\b(adh[ée]rents?|non\s*adh[ée]rents?|[ée]l[eè]ves?|élèves?|eleves?)\b.*?\d+\s*€")
 
 # bruit (menus / headers / footers)
-RE_NOISE = re.compile(r"(?i)^(l'?ecole|les cours|horaires(?: et tarifs)?|le lieu|infos ?/ ?contact|newsletter|suivez(-| )?nous|agenda 20|événements? ?(à|a) venir)$")
+RE_NOISE = re.compile(
+    r"(?i)^(l'?ecole|les cours|horaires(?: et tarifs)?|tarifs$|le lieu|infos ?/ ?contact|newsletter|suivez(-| )?nous|agenda 20|événements? ?(à|a) venir|solea productions|les compagnies|festival flamenco azul)$"
+)
 def is_noise(line: str) -> bool:
     if not line:
         return True
@@ -137,6 +157,13 @@ def detect_date_block(s: str):
         return fmt_date(y, int(mo), d), ""
     return "", ""
 
+def strip_date_from(text: str) -> str:
+    m = RE_ANYDATE.search(text or "")
+    if not m:
+        return text
+    out = (text[:m.start()] + text[m.end():]).strip(" ,;:.-")
+    return normalize_text(out)
+
 def extract_lines(html: str):
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script","style","noscript","iframe","svg"]):
@@ -157,79 +184,103 @@ def extract_lines(html: str):
 # ---------------- Endpoint ----------------
 @bp.get("/infos-stage")
 def infos_stage():
-    # Récupérer la page
-    r = requests.get(SRC, timeout=12)
-    r.raise_for_status()
-    lines = extract_lines(r.text)
+    try:
+        r = requests.get(SRC, timeout=12)
+        r.raise_for_status()
+        lines = extract_lines(r.text)
 
-    items = []
-    current = None
+        items = []
+        current = None
 
-    for raw in lines:
-        line = raw.strip()
-        if is_noise(line):
-            continue
+        for raw in lines:
+            line = raw.strip()
+            if is_noise(line):
+                continue
 
-        # Nouveau bloc si mot-clé ou date détectée
-        if KEYWORDS.search(line) or RE_ANYDATE.search(line):
-            if current and (current.get("titre") or current.get("date") or current.get("tarifs")):
-                items.append(current)
+            # Nouveau bloc seulement si MOT-CLÉ ET/OU DATE (et pas un header générique)
+            header_hit = KEYWORDS.search(line) or RE_ANYDATE.search(line)
+            if header_hit:
+                # finaliser le précédent s'il avait du contenu réel
+                if current and (current.get("titre") or current.get("date") or current.get("tarifs") or current.get("heures")):
+                    # on jote les champs vocaux ici
+                    if current.get("titre"):
+                        current["titre_vocal"] = tts_jota(current["titre"])
+                    if current.get("description"):
+                        current["description_vocal"] = tts_jota(heure_vocale(current["description"]))
+                    items.append(current)
 
-            d1, d2 = detect_date_block(line)
-            titre = strip_date_from(line)  # retirer la date intégrée au titre
-            typ = classify_type(titre or line)
+                d1, d2 = detect_date_block(line)
+                titre = strip_date_from(line)
+                typ = classify_type(titre or line)
 
-            current = {
-                "type": typ if typ != "evenement" else ("stage" if "stage" in line.lower() else typ),
-                "titre": titre if titre else None,
-                "date": d1,
-                "date_fin": d2,
-                "date_spoken": (f"du {ddmmyyyy_to_spoken_local(d1)} au {ddmmyyyy_to_spoken_local(d2)}" if d1 and d2
-                                else (ddmmyyyy_to_spoken_local(d1) if d1 else "")),
-                "heures": [],
-                "tarifs": [],
-                "description": ""
-            }
-            continue
+                # Écarter les headers trop génériques (“Stages” seul)
+                if titre and titre.lower() in {"stages", "atelier", "ateliers", "master class", "masterclass"} and not (d1 or d2):
+                    current = None
+                    continue
 
-        if not current:
-            continue
+                current = {
+                    "type": typ if typ != "evenement" else ("stage" if "stage" in line.lower() else typ),
+                    "titre": titre if titre else None,
+                    "date": d1,
+                    "date_fin": d2,
+                    "date_spoken": (f"du {ddmmyyyy_to_spoken_local(d1)} au {ddmmyyyy_to_spoken_local(d2)}" if d1 and d2
+                                    else (ddmmyyyy_to_spoken_local(d1) if d1 else "")),
+                    "heures": [],
+                    "tarifs": [],
+                    "description": ""
+                }
+                # si header sans titre mais avec date, on met un titre minimal
+                if not current["titre"] and (d1 or d2):
+                    current["titre"] = "Programme"
+                continue
 
-        # Heures → vocal propre
-        if re.search(r"\d{1,2}\s*[h:]\s*[0-5]?\d?", line):
-            hv = heure_vocale(line)
-            if hv not in current["heures"]:
-                current["heures"].append(hv)
-            continue
+            if not current:
+                continue
 
-        # Tarifs (lignes avec € ou catégories + prix)
-        if RE_TARIF_LINE.search(line) or RE_PRICE_ANY.search(line):
-            if line not in current["tarifs"]:
-                current["tarifs"].append(line)
-            continue
+            # Heures → vocal
+            if re.search(r"\d{1,2}\s*[:h]\s*[0-5]?\d?", line):
+                hv = heure_vocale(line)
+                if hv not in current["heures"]:
+                    current["heures"].append(hv)
+                continue
 
-        # Description (filtrée)
-        if not is_noise(line):
-            if current["description"]:
-                if len(current["description"]) < 800:
-                    current["description"] += " " + line
-            else:
-                current["description"] = line
+            # Tarifs
+            if RE_TARIF_LINE.search(line) or RE_PRICE_ANY.search(line):
+                if line not in current["tarifs"]:
+                    current["tarifs"].append(line)
+                continue
 
-    if current and (current.get("titre") or current.get("date") or current.get("tarifs")):
-        items.append(current)
+            # Description (filtrée)
+            if not is_noise(line):
+                if current["description"]:
+                    if len(current["description"]) < 800:
+                        current["description"] += " " + line
+                else:
+                    current["description"] = line
 
-    # Nettoyage final
-    cleaned, seen = [], set()
-    for it in items:
-        if not any([it.get("titre"), it.get("date"), it.get("tarifs"), it.get("heures")]):
-            continue
-        key = (it.get("type",""), (it.get("titre") or "")[:140], it.get("date",""), it.get("date_fin",""))
-        if key in seen:
-            continue
-        seen.add(key)
-        if not it.get("titre") and it.get("description"):
-            it["titre"] = it["description"][:120]
-        cleaned.append(it)
+        # push final
+        if current and (current.get("titre") or current.get("date") or current.get("tarifs") or current.get("heures")):
+            current["titre_vocal"] = tts_jota(current.get("titre",""))
+            current["description_vocal"] = tts_jota(heure_vocale(current.get("description","")))
+            items.append(current)
 
-    return jsonify({"source": SRC, "count": len(cleaned), "items": cleaned})
+        # Nettoyage final
+        cleaned, seen = [], set()
+        for it in items:
+            # retirer les items vides
+            if not any([it.get("titre"), it.get("date"), it.get("tarifs"), it.get("heures")]):
+                continue
+            key = (it.get("type",""), (it.get("titre") or "")[:140], it.get("date",""), it.get("date_fin",""))
+            if key in seen:
+                continue
+            seen.add(key)
+            # si titre vide mais bonne description -> promote
+            if not it.get("titre") and it.get("description"):
+                it["titre"] = it["description"][:120]
+            cleaned.append(it)
+
+        return jsonify({"source": SRC, "count": len(cleaned), "items": cleaned})
+
+    except Exception as e:
+        # pas de 500 opaque : on dit ce qui s'est passé
+        return jsonify({"source": SRC, "error": str(e)}), 500
