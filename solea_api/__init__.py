@@ -7,7 +7,7 @@ def create_app():
     # Blueprints
     from .routes.infos_cours import bp as infos_cours_bp
     from .routes.infos_agenda import bp as infos_agenda_bp
-    from .routes.infos_stage_solea import bp as infos_stage_bp
+    from .routes.infos_stage import bp as infos_stage_bp
     from .routes.infos_tablao import bp as infos_tablao_bp
 
     app.register_blueprint(infos_cours_bp)
