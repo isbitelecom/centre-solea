@@ -188,7 +188,7 @@ def fetch_html(url: str) -> str:
     except Exception:
         r = requests.get(url, headers=HEADERS_B, timeout=(REQ_TIMEOUT[0], max(REQ_TIMEOUT[1], 14)))
         r.raise_for_status()
-        r.encoding = r2.encoding or "utf-8"
+        r.encoding = r.encoding or "utf-8"   # <-- fix: ne plus référencer r2
         return r.text
 
 def soup_from_html(html: str) -> BeautifulSoup:
