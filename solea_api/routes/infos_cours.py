@@ -107,54 +107,90 @@ def infos_cours():
                     seen_line.add(l2)
                     lines.append(l2)
 
-                # 1) HORAIRES (proximité + préfixe + fallback segment complet)
+                        # 1) HORAIRES (proximité + voisins + préfixe + fallback segment complet + contexte par jour)
         horaires, seen_items = [], set()
-        PROX_WINDOW = 160  # (garde 160 ou augmente à 240 si besoin)
+        PROX_WINDOW = 200  # plus large pour couvrir blocs séparés
 
-        def _first_match(regex, text):
-            return regex.search(text) if text else None
+        # Regex enrichies (couvre "tous niveaux", "initiation", variantes, points médians)
+        LVL_RX    = re.compile(r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)", re.IGNORECASE)
+        DANCE_RX  = RE_DANCE   # garde le tien
+        PUBLIC_RX = re.compile(r"(tout\s*public|famille|parents|enfants?|ados?|adultes?)", re.IGNORECASE)
 
-        for block in text_blocks:
+        def _first_match(rx, txt):
+            return rx.search(txt) if txt else None
+
+        # Contexte cumulatif par jour (au cas où les libellés sont annoncés une fois puis suivis d'horaires)
+        contexte_par_jour = {}
+
+        # On a besoin de l'index du block pour accéder aux voisins
+        for bidx, block in enumerate(text_blocks):
             for seg in segment_by_days(block, pre_window=160):
                 seg_txt = seg["text"]
                 hour_matches = list(RE_ANY_HOUR.finditer(seg_txt))
                 if not hour_matches:
                     continue
 
-                # Fenêtres de proximité autour de la première et de la dernière heure
+                # 1) Proximité autour de la première et de la dernière heure
                 h_first = hour_matches[0]
                 h_last  = hour_matches[-1]
 
-                s1 = max(0, h_first.start() - PROX_WINDOW)
-                e1 = min(len(seg_txt), h_first.end() + PROX_WINDOW)
-                vicinity_first = seg_txt[s1:e1]
+                def window_around(hm):
+                    s = max(0, hm.start() - PROX_WINDOW)
+                    e = min(len(seg_txt), hm.end() + PROX_WINDOW)
+                    return seg_txt[s:e]
 
-                s2 = max(0, h_last.start() - PROX_WINDOW)
-                e2 = min(len(seg_txt), h_last.end() + PROX_WINDOW)
-                vicinity_last = seg_txt[s2:e2]
+                vicinity_first = window_around(h_first)
+                vicinity_last  = window_around(h_last)
 
+                # 2) Voisinage inter-blocs : queue du bloc précédent + tête du bloc suivant
+                prev_tail = text_blocks[bidx - 1][-PROX_WINDOW:] if bidx - 1 >= 0 else ""
+                next_head = text_blocks[bidx + 1][:PROX_WINDOW]  if bidx + 1 < len(text_blocks) else ""
+
+                # 3) Préfixe interne renvoyé par segment_by_days
                 pre_tail = seg.get("pre", "")[-PROX_WINDOW:] if seg.get("pre") else ""
 
-                # Ordre de recherche : prox 1 -> prox 2 -> tout segment -> préfixe
-                search_spaces = [vicinity_first, vicinity_last, seg_txt, pre_tail]
+                # 4) Tout le segment comme fallback
+                search_spaces = [vicinity_first, vicinity_last, prev_tail, next_head, seg_txt, pre_tail]
 
                 lvl_m = dance_m = public_m = None
                 for space in search_spaces:
-                    lvl_m    = lvl_m    or _first_match(RE_LVL, space)
-                    dance_m  = dance_m  or _first_match(RE_DANCE, space)
-                    public_m = public_m or _first_match(RE_PUBLIC, space)
+                    lvl_m    = lvl_m    or _first_match(LVL_RX, space)
+                    dance_m  = dance_m  or _first_match(DANCE_RX, space)
+                    public_m = public_m or _first_match(PUBLIC_RX, space)
+                    # Si on a tout, inutile d'aller plus loin
                     if lvl_m and dance_m and public_m:
                         break
 
+                # 5) Dernier filet : réutiliser un contexte déjà vu pour ce jour si dispo
+                jour_norm = seg["jour"]
+                ctx = contexte_par_jour.get(jour_norm, {"niveau": "", "danse": "", "public": ""})
+
+                niv_txt = (lvl_m.group(0) if lvl_m else ctx["niveau"])
+                dan_txt = (dance_m.group(0) if dance_m else ctx["danse"])
+                pub_txt = (public_m.group(0) if public_m else ctx["public"])
+
+                # Normalisations légères
+                def _norm_cap(s):
+                    s = (s or "").replace("·", "").strip()
+                    return s.capitalize() if s else ""
+
                 hours_text = " ".join(m.group(0) for m in hour_matches)
                 item = {
-                    "jour": seg["jour"],
+                    "jour": jour_norm,
                     "heures": hours_text.replace("–","-").replace("—","-"),
                     "heures_vocal": remplacer_h_par_heure(hours_text),
-                    "niveau": (lvl_m.group(0).capitalize() if lvl_m else ""),
-                    "danse": (sanitize_for_voice(dance_m.group(0)).capitalize() if dance_m else ""),
-                    "public": (public_m.group(0).capitalize() if public_m else ""),
+                    "niveau": _norm_cap(niv_txt),
+                    "danse":  _norm_cap(sanitize_for_voice(dan_txt)),
+                    "public": _norm_cap(pub_txt),
                 }
+
+                # Si on a réussi à trouver un des 3, on nourrit le contexte du jour
+                if item["niveau"] or item["danse"] or item["public"]:
+                    contexte_par_jour[jour_norm] = {
+                        "niveau": item["niveau"] or ctx["niveau"],
+                        "danse":  item["danse"]  or ctx["danse"],
+                        "public": item["public"] or ctx["public"],
+                    }
 
                 keyi = (item["jour"], item["heures"], item["niveau"], item["danse"], item["public"])
                 if keyi not in seen_items:
