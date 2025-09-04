@@ -40,7 +40,7 @@ RE_DANCE     = re.compile(DANCE, re.IGNORECASE)
 RE_PUBLIC    = re.compile(PUBLIC, re.IGNORECASE)
 
 # =========================
-# Regex Tarifs / Adhésions (inchangé + légères améliorations)
+# Regex Tarifs / Adhésions
 # =========================
 RE_PRICE_LINE    = re.compile(r"€")
 RE_ADHESION      = re.compile(r"Adh[ée]sion\s+annuelle[^0-9]{0,20}(\d{1,3})\s*€", re.IGNORECASE)
@@ -89,7 +89,7 @@ def infos_cours():
         soup = soup_from_html(html)
 
         # =========================
-        # RÉCOLTE TEXTE Wix (blocs + tableaux) -> text_blocks
+        # RÉCOLTE TEXTE Wix -> text_blocks / lines
         # =========================
         text_blocks = []
         for sel in ['[data-hook="richTextElement"]', '[class*="richText"]']:
@@ -124,7 +124,7 @@ def infos_cours():
         # 1) HORAIRES — Passe 1 (proximité + voisins + co-occurrence Sévillane + contexte par jour)
         # =========================
         horaires, seen_items = [], set()
-        PROX_WINDOW = 200  # fenêtrage large pour capter titres/paragraphes voisins
+        PROX_WINDOW = 200
 
         def _first_match(regex, text):
             return regex.search(text) if text else None
@@ -142,7 +142,7 @@ def infos_cours():
             s = (s or "").replace("·", "").strip()
             return s.capitalize() if s else ""
 
-        # Contexte cumulatif par jour : on y met des infos "sûres"
+        # Contexte cumulatif par jour
         contexte_par_jour = {}
 
         for bidx, block in enumerate(text_blocks):
@@ -177,7 +177,7 @@ def infos_cours():
 
                 # NIVEAU / PUBLIC
                 if is_sevi and spaces_with_sevi:
-                    # Pour Sévillane : co-occurrence stricte (et pas de "Technique" via LVL_SEVI)
+                    # Sévillanes : co-occurrence stricte (et pas "Technique")
                     lvl_m    = _search_in_spaces(RE_LVL_SEVI, spaces_with_sevi)
                     public_m = _search_in_spaces(RE_PUBLIC,    spaces_with_sevi)
                 else:
@@ -199,9 +199,9 @@ def infos_cours():
                 dan_txt = (dance_m.group(0) if dance_m else "")
                 pub_txt = (public_m.group(0) if public_m else "")
 
-                # Interdit "Technique" pour Sévillane sauf co-occurrence stricte (déjà gérée via LVL_SEVI)
+                # Interdit "Technique" pour Sévillanes (déjà via LVL_SEVI, mais double sûreté)
                 if re.search(r"s[ée]villan", dan_txt or "", re.IGNORECASE) and re.search(r"\btechnique\b", niv_txt or "", re.IGNORECASE):
-                    niv_txt = ""  # annule sur-signal
+                    niv_txt = ""
 
                 item = {
                     "jour": jour_norm,
@@ -219,8 +219,6 @@ def infos_cours():
                         ctx = {"niveau": "", "danse": item["danse"], "public": ""}  # reset niveau/public
                     else:
                         ctx["danse"] = item["danse"]
-
-                # On nourrit le contexte seulement avec des infos sûres
                 if item["niveau"]:
                     if not (re.search(r"s[ée]villan", item["danse"], re.IGNORECASE) and item["niveau"].lower() == "technique"):
                         ctx["niveau"] = item["niveau"]
@@ -252,7 +250,7 @@ def infos_cours():
             if not line:
                 continue
 
-            # Mise à jour du contexte si la ligne contient des libellés
+            # Libellés éventuels
             m_d = RE_DANCE.search(line)
             m_p = RE_PUBLIC.search(line)
             m_l = RE_LVL.search(line)
@@ -270,7 +268,7 @@ def infos_cours():
             if m_l:
                 ctx_niveau = m_l.group(0)
 
-            # Détection d'une ligne horaire avec jour
+            # Ligne horaire avec jour
             if RE_DAY_TOKEN.search(line) and RE_ANY_HOUR.search(line):
                 jour = norm_day(RE_DAY_TOKEN.search(line).group(0))
                 hours_text = " ".join(m.group(0) for m in RE_ANY_HOUR.finditer(line))
@@ -280,14 +278,13 @@ def infos_cours():
                 end   = min(N, i + NEIGHB + 1)
                 neigh_txt = "\n".join(lines[start:end])
 
-                # Recherche locale
                 danse  = (RE_DANCE.search(neigh_txt) or (RE_DANCE.search(ctx_danse) if isinstance(ctx_danse, str) else None))
                 is_sevi_line = bool(danse and re.search(r"s[ée]villan", danse.group(0), re.IGNORECASE))
 
                 if is_sevi_line:
-                    lvl    = (RE_LVL_SEVI.search(neigh_txt) or (RE_LVL_SEVI.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
+                    lvl = (RE_LVL_SEVI.search(neigh_txt) or (RE_LVL_SEVI.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
                 else:
-                    lvl    = (RE_LVL.search(neigh_txt) or (RE_LVL.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
+                    lvl = (RE_LVL.search(neigh_txt) or (RE_LVL.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
 
                 public = (RE_PUBLIC.search(neigh_txt) or (RE_PUBLIC.search(ctx_public) if isinstance(ctx_public, str) else None))
 
@@ -301,12 +298,12 @@ def infos_cours():
                     "public": "",
                 })
 
-                # Compléter à partir de la ligne + contexte
+                # Compléter
                 niv_txt = (lvl.group(0) if lvl else ctx_niveau)
                 dan_txt = (sanitize_for_voice(danse.group(0) if danse else ctx_danse))
                 pub_txt = (public.group(0) if public else ctx_public)
 
-                # Sévillanes : ne jamais poser "Technique" depuis le contexte
+                # Sévillanes : ne jamais poser "Technique"
                 if re.search(r"s[ée]villan", dan_txt or "", re.IGNORECASE) and (niv_txt or "").lower() == "technique":
                     niv_txt = ""
 
@@ -316,8 +313,52 @@ def infos_cours():
 
                 by_key[k] = item
 
-        # Réécrit la liste horaires consolidée
+        # Consolidation
         horaires = list(by_key.values())
+
+        # =========================
+        # 1.c) NORMALISATION MÉTIER (anti-erreurs demandées)
+        # =========================
+        def is_sevi(danse: str) -> bool:
+            return bool(re.search(r"s[ée]villan", (danse or ""), re.IGNORECASE))
+
+        def is_flamenco(danse: str) -> bool:
+            return "flamenco" in (danse or "").lower()
+
+        def canon_lvl(lvl: str) -> str:
+            s = (lvl or "").lower()
+            if "début" in s or "debut" in s:
+                return "Débutants"
+            if "avanc" in s:
+                return "Avancés"
+            if "inter" in s:
+                return "Intermédiaire"
+            if "tous" in s or "multi" in s:
+                return "Tous niveaux"
+            if "initiation" in s:
+                return "Initiation"
+            if "technique" in s:
+                return "Technique"
+            return (lvl or "").capitalize()
+
+        def apply_business_rules(h):
+            # Canonicalise le niveau
+            h["niveau"] = canon_lvl(h.get("niveau"))
+
+            # Règles Sévillanes : pas de public, niveaux uniquement Débutants / Avancés
+            if is_sevi(h.get("danse")):
+                h["public"] = ""
+                if h["niveau"] not in {"Débutants", "Avancés"}:
+                    h["niveau"] = ""
+
+            # Règles Flamenco Enfants/Ados : pas de "Technique"
+            if is_flamenco(h.get("danse")) and h.get("public") in {"Enfants", "Ados"}:
+                if h.get("niveau", "").lower() == "technique":
+                    h["niveau"] = ""
+
+            return h
+
+        horaires = [apply_business_rules(dict(h)) for h in horaires]
 
         # =========================
         # Filtres anti faux-positifs
@@ -345,7 +386,7 @@ def infos_cours():
         horaires = [h for h in horaires if not _is_sevi_technique_vendredi(h)]
 
         # =========================
-        # 2) TARIFS (comme avant)
+        # 2) TARIFS (identique à avant)
         # =========================
         tarifs_par_nb = {}
         tarifs_lignes = []
@@ -396,7 +437,7 @@ def infos_cours():
         m_ad = RE_ADHESION.search(full_txt)
         adhesion = f"{m_ad.group(1)} €" if m_ad else ""
 
-        # Niveaux Sévillanes (info de synthèse éventuelle)
+        # Niveaux Sévillanes (synthèse informative)
         niveaux_sevillane = []
         for l in lines:
             if re.search(r"s[ée]villan", l, re.IGNORECASE) and RE_LVL.search(l):
@@ -405,14 +446,8 @@ def infos_cours():
                     norm = "Débutants"
                 elif "avanc" in raw:
                     norm = "Avancés"
-                elif "inter" in raw:
-                    norm = "Intermédiaire"
-                elif "tous" in raw or "multi" in raw:
-                    norm = "Tous niveaux"
-                elif "initiation" in raw:
-                    norm = "Initiation"
                 else:
-                    norm = raw.capitalize()
+                    continue  # on ignore le reste (règle métier)
                 if norm not in niveaux_sevillane:
                     niveaux_sevillane.append(norm)
 
@@ -421,7 +456,8 @@ def infos_cours():
         # =========================
         horaires_vocal = []
         for h in horaires:
-            extra = " ".join([x for x in [h["danse"], h["public"], h["niveau"]] if x])
+            extra_parts = [x for x in [h["danse"], h["public"], h["niveau"]] if x]
+            extra = " ".join(extra_parts)
             lead = f"Voici les horaires pour {extra} : " if extra else ""
             phrase = f"{lead}{h['jour']} {h['heures_vocal']}"
             horaires_vocal.append(sanitize_for_voice(phrase))
