@@ -107,9 +107,12 @@ def infos_cours():
                     seen_line.add(l2)
                     lines.append(l2)
 
-        # 1) HORAIRES (proximité + préfixe)
+                # 1) HORAIRES (proximité + préfixe + fallback segment complet)
         horaires, seen_items = [], set()
-        PROX_WINDOW = 120
+        PROX_WINDOW = 160  # (garde 160 ou augmente à 240 si besoin)
+
+        def _first_match(regex, text):
+            return regex.search(text) if text else None
 
         for block in text_blocks:
             for seg in segment_by_days(block, pre_window=160):
@@ -118,22 +121,30 @@ def infos_cours():
                 if not hour_matches:
                     continue
 
-                h0 = hour_matches[0]
-                s = max(0, h0.start() - PROX_WINDOW)
-                e = min(len(seg_txt), h0.end() + PROX_WINDOW)
-                vicinity = seg_txt[s:e]
+                # Fenêtres de proximité autour de la première et de la dernière heure
+                h_first = hour_matches[0]
+                h_last  = hour_matches[-1]
 
-                lvl_m    = RE_LVL.search(vicinity)
-                dance_m  = RE_DANCE.search(vicinity)
-                public_m = RE_PUBLIC.search(vicinity)
+                s1 = max(0, h_first.start() - PROX_WINDOW)
+                e1 = min(len(seg_txt), h_first.end() + PROX_WINDOW)
+                vicinity_first = seg_txt[s1:e1]
 
-                # fallback : préfixe avant le jour
-                if not (lvl_m or dance_m or public_m):
-                    pre_tail = seg.get("pre", "")[-PROX_WINDOW:]
-                    if pre_tail:
-                        lvl_m    = lvl_m    or RE_LVL.search(pre_tail)
-                        dance_m  = dance_m  or RE_DANCE.search(pre_tail)
-                        public_m = public_m or RE_PUBLIC.search(pre_tail)
+                s2 = max(0, h_last.start() - PROX_WINDOW)
+                e2 = min(len(seg_txt), h_last.end() + PROX_WINDOW)
+                vicinity_last = seg_txt[s2:e2]
+
+                pre_tail = seg.get("pre", "")[-PROX_WINDOW:] if seg.get("pre") else ""
+
+                # Ordre de recherche : prox 1 -> prox 2 -> tout segment -> préfixe
+                search_spaces = [vicinity_first, vicinity_last, seg_txt, pre_tail]
+
+                lvl_m = dance_m = public_m = None
+                for space in search_spaces:
+                    lvl_m    = lvl_m    or _first_match(RE_LVL, space)
+                    dance_m  = dance_m  or _first_match(RE_DANCE, space)
+                    public_m = public_m or _first_match(RE_PUBLIC, space)
+                    if lvl_m and dance_m and public_m:
+                        break
 
                 hours_text = " ".join(m.group(0) for m in hour_matches)
                 item = {
@@ -142,8 +153,9 @@ def infos_cours():
                     "heures_vocal": remplacer_h_par_heure(hours_text),
                     "niveau": (lvl_m.group(0).capitalize() if lvl_m else ""),
                     "danse": (sanitize_for_voice(dance_m.group(0)).capitalize() if dance_m else ""),
-                    "public": (public_m.group(0).capitalize() if public_m else "")
+                    "public": (public_m.group(0).capitalize() if public_m else ""),
                 }
+
                 keyi = (item["jour"], item["heures"], item["niveau"], item["danse"], item["public"])
                 if keyi not in seen_items:
                     seen_items.add(keyi)
