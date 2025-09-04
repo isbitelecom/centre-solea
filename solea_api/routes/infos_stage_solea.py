@@ -23,6 +23,38 @@ RE_PRICE_ANY = re.compile(r"€")
 RE_TARIF_CAT = re.compile(r"(?i)\b(adh[ée]rents?|non\s*adh[ée]rents?|[ée]l[eè]ves?)\b[^0-9]{0,20}([0-9 ][0-9 ]*)\s*€")
 
 
+# --- Helpers anti-"oct" → int() ---
+def _ensure_month_int(m):
+    """Retourne un mois 1..12 en int depuis int/str/abréviation FR."""
+    if isinstance(m, int):
+        return m
+    s = str(m).strip().lower()
+    # tente direct int (ex: "10")
+    try:
+        return int(s)
+    except Exception:
+        pass
+    # sinon passe par month_to_int_any (gère "oct", "oct.", "octobre", etc.)
+    mi = month_to_int_any(s)
+    if isinstance(mi, int):
+        return mi
+    # si month_to_int_any renvoie un str, re-tente int; sinon erreur claire
+    try:
+        return int(str(mi).strip())
+    except Exception:
+        raise ValueError(f"Mois invalide: {m!r}")
+
+def _ensure_day_int(d):
+    """Force le jour en int."""
+    return int(str(d).strip())
+
+def safe_fmt_date(y, m, d):
+    """Appelle fmt_date avec mois/jour garantis en int."""
+    mi = _ensure_month_int(m)
+    di = _ensure_day_int(d)
+    return fmt_date(y, mi, di)
+
+
 def detect_date_block(s: str):
     # du X au Y mois [année]
     m = RE_RANGE.search(s)
@@ -31,8 +63,7 @@ def detect_date_block(s: str):
         mon_txt = m.group(3)  # ex: 'oct', 'oct.', 'octobre'
         y = m.group(4)
         y = int(y) if y else None
-        mon = month_to_int_any(mon_txt)  # <-- conversion des mois texte → entier
-        return fmt_date(y, mon, d1), fmt_date(y, mon, d2)
+        return safe_fmt_date(y, mon_txt, d1), safe_fmt_date(y, mon_txt, d2)
 
     # "12 et 13 mois [année]"
     m = RE_DUO.search(s)
@@ -41,8 +72,7 @@ def detect_date_block(s: str):
         mon_txt = m.group(3)
         y = m.group(4)
         y = int(y) if y else None
-        mon = month_to_int_any(mon_txt)
-        return fmt_date(y, mon, d1), fmt_date(y, mon, d2)
+        return safe_fmt_date(y, mon_txt, d1), safe_fmt_date(y, mon_txt, d2)
 
     # "12 mois [année?]"
     m = RE_SINGLE.search(s)
@@ -51,8 +81,7 @@ def detect_date_block(s: str):
         mon_txt = m.group(2)
         y = m.group(3)
         y = int(y) if y else None
-        mon = month_to_int_any(mon_txt)
-        return fmt_date(y, mon, d), ""
+        return safe_fmt_date(y, mon_txt, d), ""
 
     # "12/10[/2024]" etc.
     m = RE_NUM.search(s)
@@ -61,8 +90,8 @@ def detect_date_block(s: str):
         y = int(yy) if yy else None
         if y is not None and y < 100:
             y += 2000
-        # mo est numérique (1-12) : on le cast en int par cohérence
-        return fmt_date(y, int(mo), d), ""
+        # mo est numérique : on force en int
+        return safe_fmt_date(y, int(mo), d), ""
 
     return "", ""
 
