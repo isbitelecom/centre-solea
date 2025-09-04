@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 import re
 from datetime import date, timedelta
 from bs4 import NavigableString
+from urllib.parse import urljoin
 
 from ..utils import (
     fetch_html, soup_from_html, normalize_text, sanitize_for_voice,
@@ -11,7 +12,8 @@ from ..utils import (
 )
 
 bp = Blueprint("infos_tablao", __name__)
-SRC = "https://www.centresolea.org/"  # on filtre "tablao" depuis la page principale
+BASE = "https://www.centresolea.org"
+SRC = f"{BASE}/"  # on filtre "tablao" depuis la page principale
 
 
 @bp.get("/infos-tablao")
@@ -23,17 +25,16 @@ def infos_tablao():
         html = fetch_html(SRC)
         soup = soup_from_html(html)
 
-        # ========= 0) Aides & Regex =========
-        PAGE_TEXT = soup.get_text("\n", strip=True)
+        # ========= Aides & Regex =========
+        page_text = soup.get_text("\n", strip=True)
 
         # Saison (ex. "AGENDA 2025-2026") pour inférer l'année si absente
         season_years = []
-        m_season = re.search(r"\b(20\d{2})\s*[-/]\s*(20\d{2})\b", PAGE_TEXT)
+        m_season = re.search(r"\b(20\d{2})\s*[-/]\s*(20\d{2})\b", page_text)
         if m_season:
             y1, y2 = int(m_season.group(1)), int(m_season.group(2))
             season_years = [y1, y2]
 
-        # Mois (mots + abréviations FR courantes)
         MOIS = {
             "janvier": 1, "janv": 1,
             "février": 2, "fevrier": 2, "févr": 2, "fevr": 2,
@@ -55,7 +56,6 @@ def infos_tablao():
         )
         JOURS = r"(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)"
 
-        # Dates en toutes lettres: "Vendredi 26 septembre 2025", "Samedi 1er nov.", ...
         DATE_RX_WORDS = re.compile(
             rf"(?:(?:du|le|les)?\s*)?(?:{JOURS}\s+)?"
             rf"(\d{{1,2}}(?:er)?)\s+"
@@ -63,7 +63,6 @@ def infos_tablao():
             rf"(?:\s+(20\d{{2}}))?",
             re.IGNORECASE
         )
-        # Deuxième date dans la même phrase : "... et Samedi 27 septembre ..."
         ET_DATE_RX = re.compile(
             rf"\bet\s+(?:{JOURS}\s+)?"
             rf"(\d{{1,2}}(?:er)?)\s+"
@@ -71,7 +70,6 @@ def infos_tablao():
             rf"(?:\s+(20\d{{2}}))?",
             re.IGNORECASE
         )
-        # Plage: "du Vendredi 25 octobre (2025) au Samedi 26 octobre (2025)"
         RANGE_RX = re.compile(
             rf"\bdu\s+(?:{JOURS}\s+)?"
             rf"(\d{{1,2}}(?:er)?)\s+"
@@ -83,10 +81,7 @@ def infos_tablao():
             rf"(?:\s+(20\d{{2}}))?",
             re.IGNORECASE
         )
-        # Formats numériques français: "26/09", "26/09/2025", "26-09", "26-09-2025"
-        DATE_RX_NUM = re.compile(
-            r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b"
-        )
+        DATE_RX_NUM = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b")
 
         def infer_year(month_num: int, explicit_year: int | None) -> int | None:
             if explicit_year:
@@ -106,8 +101,7 @@ def infos_tablao():
             return ""
 
         def to_ddmmyyyy_from_num(day_s: str, month_s: str, year_s: str | None) -> str:
-            dd = int(day_s)
-            mm = int(month_s)
+            dd = int(day_s); mm = int(month_s)
             yy = int(year_s) if year_s else infer_year(mm, None)
             if 1 <= dd <= 31 and 1 <= mm <= 12 and yy:
                 return f"{dd:02d}/{mm:02d}/{yy}"
@@ -141,9 +135,6 @@ def infos_tablao():
                 cur += timedelta(days=1)
             return out
 
-        def extract_times(txt: str) -> str:
-            return extract_time_from_text(txt) or ""
-
         def extract_lieu(txt: str) -> str:
             # Heuristique: dernier segment après " - " | " — " | "–" | " @ "
             parts = re.split(r"\s+(?:-|—|–|@)\s+", txt)
@@ -151,144 +142,181 @@ def infos_tablao():
                 return parts[-1].strip()
             return ""
 
-        # ========= 1) Repérer les "blocs TABLAO" par le DOM =========
-        # On considère comme "titre" tout élément qui contient "tablao" (h*, strong, b, a, span fort)
+        def any_date_in(text: str) -> list[str]:
+            """Retourne une liste de dates dd/mm/yyyy trouvées dans le texte."""
+            out = []
+
+            # Plages
+            for mr in RANGE_RX.finditer(text):
+                out.extend(expand_range(mr))
+
+            # Dates mots
+            for m1 in DATE_RX_WORDS.finditer(text):
+                d = to_ddmmyyyy_from_words(m1.group(1), m1.group(2), m1.group(3))
+                if d:
+                    out.append(d)
+            for m2 in ET_DATE_RX.finditer(text):
+                d = to_ddmmyyyy_from_words(m2.group(1), m2.group(2), m2.group(3))
+                if d:
+                    out.append(d)
+
+            # Numériques
+            for mn in DATE_RX_NUM.finditer(text):
+                d = to_ddmmyyyy_from_num(mn.group(1), mn.group(2), mn.group(3))
+                if d:
+                    out.append(d)
+
+            # déduplique en conservant l'ordre
+            seen_d = set()
+            uniq = []
+            for d in out:
+                if d not in seen_d:
+                    seen_d.add(d)
+                    uniq.append(d)
+            return uniq
+
+        # ========= Sélection des titres contenant "tablao" =========
         title_nodes = []
-        candidates = soup.select("h1, h2, h3, h4, h5, h6, strong, b, a, span, p")
-        for n in candidates:
+        for n in soup.select("h1, h2, h3, h4, h5, h6, strong, b, a, span, p"):
             try:
                 txt = normalize_text(n.get_text(" ", strip=True))
             except Exception:
                 continue
-            if not txt:
-                continue
-            if re.search(r"\btablao?s?\b", txt, re.IGNORECASE):
+            if txt and re.search(r"\btablao?s?\b", txt, re.IGNORECASE):
                 title_nodes.append(n)
 
-        def gather_block_text(node) -> tuple[str, str]:
-            """
-            Retourne (titre, bloc_texte) à partir d'un noeud titre "tablao".
-            On concatène le texte du noeud + ses frères suivants jusqu'à un "separateur".
-            """
-            title = normalize_text(node.get_text(" ", strip=True)) or "Tablao"
-            pieces = [title]
+        def find_related_href(node):
+            """Trouve une URL de détails proche du titre."""
+            # 1) le titre est déjà un lien
+            if getattr(node, "name", "") == "a" and node.get("href"):
+                return urljoin(BASE, node.get("href"))
 
-            # Stop si on tombe sur un nouveau "gros titre" ou HR
-            STOP_TAGS = {"h1", "h2", "h3", "h4", "hr"}
+            # 2) lien descendant
+            a = getattr(node, "find", lambda *_: None)("a")
+            if a and a.get("href"):
+                return urljoin(BASE, a.get("href"))
 
-            # On parcourt d'abord les frères suivants du parent (souvent, Wix encapsule par paragraphes)
-            parent = node if node.name in {"h1", "h2", "h3", "h4", "p"} else node.parent
-            if not parent:
-                parent = node
-
+            # 3) frères suivants immédiats (quelques pas)
+            parent = node.parent or node
+            steps = 0
             for sib in parent.next_siblings:
+                steps += 1
+                if steps > 6:  # on ne va pas trop loin
+                    break
+                if getattr(sib, "name", "") and hasattr(sib, "select"):
+                    for cand in sib.select("a"):
+                        href = cand.get("href")
+                        if href:
+                            return urljoin(BASE, href)
+
+            # 4) ancêtre: chercher un lien "En savoir plus"
+            anc = node.parent
+            depth = 0
+            while anc and depth < 4:
+                depth += 1
+                for cand in anc.select("a"):
+                    href = cand.get("href")
+                    if href:
+                        return urljoin(BASE, href)
+                anc = anc.parent
+
+            return None
+
+        def gather_local_block(node) -> str:
+            """Concatène le texte du titre + 6 frères suivants de son parent (cartes Wix)."""
+            pieces = [normalize_text(node.get_text(" ", strip=True))]
+            parent = node if node.name in {"h1", "h2", "h3", "h4", "p"} else node.parent or node
+            steps = 0
+            for sib in parent.next_siblings:
+                if steps >= 6:
+                    break
+                steps += 1
                 nm = getattr(sib, "name", "") or ""
-                if nm.lower() in STOP_TAGS:
+                if nm.lower() in {"h1", "h2", "h3", "h4", "hr"}:
                     break
                 if hasattr(sib, "get_text"):
                     pieces.append(normalize_text(sib.get_text(" ", strip=True)))
                 elif isinstance(sib, NavigableString):
                     pieces.append(normalize_text(str(sib)))
+            return "\n".join([p for p in pieces if p])
 
-            block = "\n".join([p for p in pieces if p])
-            return title, block
+        def parse_detail(url: str) -> tuple[list[str], str, str]:
+            """Retourne (dates[], heure, lieu) depuis la page détail si possible."""
+            try:
+                h = fetch_html(url)
+                sp = soup_from_html(h)
+            except Exception:
+                return [], "", ""
+            txt = normalize_text(sp.get_text("\n", strip=True))
+            dates = any_date_in(txt)
+            hr = extract_time_from_text(txt) or ""
+            # Lieu : heuristique — la ligne qui contient une adresse “Rue”, “Marseille”, etc.
+            lieu = ""
+            for line in re.split(r"\n+", txt):
+                if re.search(r"(Marseille|Rue|France|130\d{2})", line, re.IGNORECASE):
+                    lieu = line.strip()
+                    break
+            return dates, hr, lieu
 
-        # ========= 2) Extraction d'événements (uniquement titres contenant 'tablao') =========
+        # ========= Extraction =========
         items, seen = [], set()
 
         for node in title_nodes:
-            title, block = gather_block_text(node)
+            title = normalize_text(node.get_text(" ", strip=True)) or "Tablao"
 
-            # Heuristique: si le "bloc" est trop court (juste un mot), on regarde aussi le parent précédent
-            if len(block) < 10 and node.parent and node.parent.previous_sibling:
-                prev = node.parent.previous_sibling
-                if hasattr(prev, "get_text"):
-                    block = normalize_text(prev.get_text(" ", strip=True)) + "\n" + block
-
-            # heures / lieu (sur tout le bloc)
-            hr = extract_times(block)
+            # 1) d'abord le bloc local autour du titre
+            block = gather_local_block(node)
+            dates = any_date_in(block)
+            hr = extract_time_from_text(block) or ""
             lieu = extract_lieu(block)
 
-            # 2.a Plages "du ... au ..."
-            for mr in RANGE_RX.finditer(block):
-                for dd in expand_range(mr):
-                    keyi = (dd, title.lower()[:160], hr)
-                    if keyi in seen:
-                        continue
-                    seen.add(keyi)
-                    items.append({
-                        "type": "tablao",
-                        "date": dd,
-                        "date_spoken": ddmmyyyy_to_spoken(dd),
-                        "heure": hr,
-                        "heure_vocal": remplacer_h_par_heure(hr),
-                        "titre": sanitize_for_voice(title),
-                        "lieu": sanitize_for_voice(lieu),
-                    })
-
-            # 2.b Dates "mots" principales + "et ..."
-            m1 = DATE_RX_WORDS.search(block)
-            if m1:
-                d1 = to_ddmmyyyy_from_words(m1.group(1), m1.group(2), m1.group(3))
-                if d1:
-                    keyi = (d1, title.lower()[:160], hr)
-                    if keyi not in seen:
-                        seen.add(keyi)
-                        items.append({
-                            "type": "tablao",
-                            "date": d1,
-                            "date_spoken": ddmmyyyy_to_spoken(d1),
-                            "heure": hr,
-                            "heure_vocal": remplacer_h_par_heure(hr),
-                            "titre": sanitize_for_voice(title),
-                            "lieu": sanitize_for_voice(lieu),
-                        })
-                for m2 in ET_DATE_RX.finditer(block):
-                    d2 = to_ddmmyyyy_from_words(m2.group(1), m2.group(2), m2.group(3))
+            # 2) si aucune date trouvée, on tente la page de détails
+            if not dates:
+                href = find_related_href(node)
+                if href:
+                    d2, hr2, lieu2 = parse_detail(href)
                     if d2:
-                        keyi = (d2, title.lower()[:160], hr)
-                        if keyi not in seen:
-                            seen.add(keyi)
-                            items.append({
-                                "type": "tablao",
-                                "date": d2,
-                                "date_spoken": ddmmyyyy_to_spoken(d2),
-                                "heure": hr,
-                                "heure_vocal": remplacer_h_par_heure(hr),
-                                "titre": sanitize_for_voice(title),
-                                "lieu": sanitize_for_voice(lieu),
-                            })
+                        dates = d2
+                    if hr2 and not hr:
+                        hr = hr2
+                    if lieu2 and not lieu:
+                        lieu = lieu2
 
-            # 2.c Formats numériques (dd/mm[/yyyy]) éventuels
-            for mn in DATE_RX_NUM.finditer(block):
-                dnum = to_ddmmyyyy_from_num(mn.group(1), mn.group(2), mn.group(3))
-                if dnum:
-                    keyi = (dnum, title.lower()[:160], hr)
-                    if keyi not in seen:
-                        seen.add(keyi)
-                        items.append({
-                            "type": "tablao",
-                            "date": dnum,
-                            "date_spoken": ddmmyyyy_to_spoken(dnum),
-                            "heure": hr,
-                            "heure_vocal": remplacer_h_par_heure(hr),
-                            "titre": sanitize_for_voice(title),
-                            "lieu": sanitize_for_voice(lieu),
-                        })
+            # 3) si toujours rien, on passe (pas de date = pas d'événement)
+            if not dates:
+                continue
 
-        # ========= 3) Tri chronologique =========
+            titre_norm = sanitize_for_voice(title)
+            lieu_norm = sanitize_for_voice(lieu)
+
+            for dd in dates:
+                keyi = (dd, titre_norm.lower()[:160], hr)
+                if keyi in seen:
+                    continue
+                seen.add(keyi)
+                items.append({
+                    "type": "tablao",
+                    "date": dd,
+                    "date_spoken": ddmmyyyy_to_spoken(dd),
+                    "heure": hr,
+                    "heure_vocal": remplacer_h_par_heure(hr),
+                    "titre": titre_norm,
+                    "lieu": lieu_norm,
+                })
+
+        # ========= Tri =========
         def k(e):
             if e.get("date"):
                 try:
                     dd, mm, yyyy = e["date"].split("/")
                     return (int(yyyy), int(mm), int(dd))
                 except Exception:
-                    return (9999, 12, 31)
+                    pass
             return (9999, 12, 31)
 
         items.sort(key=k)
 
-        # ========= 4) Version "vocale" =========
+        # ========= Version vocale =========
         tablaos_vocal = []
         for e in items:
             parts = [f"Tablao le {e['date_spoken']}"]
@@ -305,7 +333,7 @@ def infos_tablao():
             "tablaos": items,
             "tablaos_vocal": tablaos_vocal
         }
-        cache_set(key, payload, ttl_seconds=120)
+        cache_set(key, payload, ttl_seconds=180)
         return jsonify({**payload, "cache": cache_meta(True, entry)})
 
     except Exception as e:
