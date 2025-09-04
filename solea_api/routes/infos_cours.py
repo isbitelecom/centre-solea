@@ -11,33 +11,44 @@ bp = Blueprint("infos_cours", __name__)
 
 SRC = "https://www.centresolea.org/horaires-et-tarifs"
 
-# Regex robustes
+# =========================
+# Regex de base (jours/heures)
+# =========================
 DAY_TOKEN = (
     r"(?<![A-Za-zÀ-ÖØ-öø-ÿ])"
     r"(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|"
     r"lun\.?|mar\.?|mer\.?|jeu\.?|ven\.?|sam\.?|dim\.?)"
     r"(?![A-Za-zÀ-ÖØ-öø-ÿ])"
 )
-HOUR   = r"(?:\d{1,2}\s*(?:h|:)\s*[0-5]?\d|\d{1,2}\s*h)"
-H_RANGE= rf"(?:{HOUR}\s*(?:-|–|—|à|a)\s*{HOUR})"
-H_ANY  = rf"(?:{H_RANGE}|{HOUR})"
-LVL    = r"(débutant(?:e|s)?|debutant(?:e|s)?|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)"
-DANCE  = r"(flamenco|s[ée]villan(?:e|es)?)"
-PUBLIC = r"(enfants?|ados?|adultes?)"
+HOUR    = r"(?:\d{1,2}\s*(?:h|:)\s*[0-5]?\d|\d{1,2}\s*h)"
+H_RANGE = rf"(?:{HOUR}\s*(?:-|–|—|à|a)\s*{HOUR})"
+H_ANY   = rf"(?:{H_RANGE}|{HOUR})"
+
+# =========================
+# Regex sémantiques (élargies)
+# =========================
+LVL       = r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)"
+LVL_SEVI  = r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement)"  # pas "technique" pour Sévillanes
+DANCE     = r"(flamenco|s[ée]villan(?:e|es)?)"
+PUBLIC    = r"(tout\s*public|famille|parents|enfants?|ados?|adultes?)"
 
 RE_DAY_TOKEN = re.compile(DAY_TOKEN, re.IGNORECASE)
 RE_ANY_HOUR  = re.compile(H_ANY, re.IGNORECASE)
 RE_LVL       = re.compile(LVL, re.IGNORECASE)
+RE_LVL_SEVI  = re.compile(LVL_SEVI, re.IGNORECASE)
 RE_DANCE     = re.compile(DANCE, re.IGNORECASE)
 RE_PUBLIC    = re.compile(PUBLIC, re.IGNORECASE)
 
+# =========================
+# Regex Tarifs / Adhésions (inchangé + légères améliorations)
+# =========================
 RE_PRICE_LINE    = re.compile(r"€")
 RE_ADHESION      = re.compile(r"Adh[ée]sion\s+annuelle[^0-9]{0,20}(\d{1,3})\s*€", re.IGNORECASE)
 RE_REDUIT_BLOCK  = re.compile(r"(r[ée]duit|r[ée]duction|minima|[ée]tudiant|ch[oô]meur|famille|RSA|CAF|bourse)", re.IGNORECASE)
 RE_PAY           = re.compile(r"(paiement|r[èe]glement|trimestre|mensuel|esp[eè]ces|ch[eè]ques|CB|carte|liquide|virement)", re.IGNORECASE)
 RE_PAIR_NR       = re.compile(r"^\s*([0-9][0-9 ]{1,3})\s*€\s*\|\s*([0-9][0-9 ]{1,3})\s*€\s*$")
 RE_TARIFS_HEADER = re.compile(r"^TARIFS\s+AU\s+TRIMESTRE$", re.IGNORECASE)
-RE_TARIFS_CATEGORIES= re.compile(r"(?i)\b(adh[ée]rents?|[ée]l[eè]ves?|non\s*adh[ée]rents?)\b[^0-9]{0,15}([0-9 ][0-9 ]*)\s*€")
+RE_TARIFS_CATEGORIES = re.compile(r"(?i)\b(adh[ée]rents?|[ée]l[eè]ves?|non\s*adh[ée]rents?)\b[^0-9]{0,15}([0-9 ][0-9 ]*)\s*€")
 
 DAY_MAP = {
     "lun": "Lundi", "lun.": "Lundi", "lundi": "Lundi",
@@ -77,28 +88,30 @@ def infos_cours():
         html = fetch_html(SRC)
         soup = soup_from_html(html)
 
-        # RÉCOLTE TEXTE Wix
+        # =========================
+        # RÉCOLTE TEXTE Wix (blocs + tableaux) -> text_blocks
+        # =========================
         text_blocks = []
         for sel in ['[data-hook="richTextElement"]', '[class*="richText"]']:
             for el in soup.select(sel):
                 t = normalize_text(el.get_text("\n", strip=True))
                 if t:
                     text_blocks.append(t)
-        for el in soup.find_all(["h2","h3","h4","p","li"]):
+        for el in soup.find_all(["h2", "h3", "h4", "p", "li"]):
             t = normalize_text(el.get_text("\n", strip=True))
             if t:
                 text_blocks.append(t)
         for table in soup.find_all("table"):
             rows = []
             for tr in table.find_all("tr"):
-                cells = [normalize_text(td.get_text(" ", strip=True)) for td in tr.find_all(["td","th"])]
+                cells = [normalize_text(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
                 row = " | ".join([c for c in cells if c])
                 if row:
                     rows.append(row)
             if rows:
                 text_blocks.append("\n".join(rows))
 
-        # Lignes à plat
+        # Lignes à plat (dédupliquées)
         seen_line, lines = set(), []
         for block in text_blocks:
             for l in re.split(r"\n+", block):
@@ -107,22 +120,31 @@ def infos_cours():
                     seen_line.add(l2)
                     lines.append(l2)
 
-                        # 1) HORAIRES (proximité + voisins + préfixe + fallback segment complet + contexte par jour)
+        # =========================
+        # 1) HORAIRES — Passe 1 (proximité + voisins + co-occurrence Sévillane + contexte par jour)
+        # =========================
         horaires, seen_items = [], set()
-        PROX_WINDOW = 200  # plus large pour couvrir blocs séparés
+        PROX_WINDOW = 200  # fenêtrage large pour capter titres/paragraphes voisins
 
-        # Regex enrichies (couvre "tous niveaux", "initiation", variantes, points médians)
-        LVL_RX    = re.compile(r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)", re.IGNORECASE)
-        DANCE_RX  = RE_DANCE   # garde le tien
-        PUBLIC_RX = re.compile(r"(tout\s*public|famille|parents|enfants?|ados?|adultes?)", re.IGNORECASE)
+        def _first_match(regex, text):
+            return regex.search(text) if text else None
 
-        def _first_match(rx, txt):
-            return rx.search(txt) if txt else None
+        def _search_in_spaces(rx, spaces):
+            for s in spaces:
+                if not s:
+                    continue
+                m = rx.search(s)
+                if m:
+                    return m
+            return None
 
-        # Contexte cumulatif par jour (au cas où les libellés sont annoncés une fois puis suivis d'horaires)
+        def _norm_cap(s):
+            s = (s or "").replace("·", "").strip()
+            return s.capitalize() if s else ""
+
+        # Contexte cumulatif par jour : on y met des infos "sûres"
         contexte_par_jour = {}
 
-        # On a besoin de l'index du block pour accéder aux voisins
         for bidx, block in enumerate(text_blocks):
             for seg in segment_by_days(block, pre_window=160):
                 seg_txt = seg["text"]
@@ -130,74 +152,176 @@ def infos_cours():
                 if not hour_matches:
                     continue
 
-                # 1) Proximité autour de la première et de la dernière heure
-                h_first = hour_matches[0]
-                h_last  = hour_matches[-1]
-
-                def window_around(hm):
+                # Proximité autour de la première et de la dernière heure
+                h_first, h_last = hour_matches[0], hour_matches[-1]
+                def _win(hm):
                     s = max(0, hm.start() - PROX_WINDOW)
                     e = min(len(seg_txt), hm.end() + PROX_WINDOW)
                     return seg_txt[s:e]
+                vicinity_first = _win(h_first)
+                vicinity_last  = _win(h_last)
 
-                vicinity_first = window_around(h_first)
-                vicinity_last  = window_around(h_last)
-
-                # 2) Voisinage inter-blocs : queue du bloc précédent + tête du bloc suivant
+                # Voisinage inter-blocs (queue du précédent / tête du suivant)
                 prev_tail = text_blocks[bidx - 1][-PROX_WINDOW:] if bidx - 1 >= 0 else ""
                 next_head = text_blocks[bidx + 1][:PROX_WINDOW]  if bidx + 1 < len(text_blocks) else ""
 
-                # 3) Préfixe interne renvoyé par segment_by_days
+                # Préfixe interne renvoyé par segment_by_days
                 pre_tail = seg.get("pre", "")[-PROX_WINDOW:] if seg.get("pre") else ""
 
-                # 4) Tout le segment comme fallback
                 search_spaces = [vicinity_first, vicinity_last, prev_tail, next_head, seg_txt, pre_tail]
+                spaces_with_sevi = [s for s in search_spaces if re.search(r"s[ée]villan", s or "", re.IGNORECASE)]
 
-                lvl_m = dance_m = public_m = None
-                for space in search_spaces:
-                    lvl_m    = lvl_m    or _first_match(LVL_RX, space)
-                    dance_m  = dance_m  or _first_match(DANCE_RX, space)
-                    public_m = public_m or _first_match(PUBLIC_RX, space)
-                    # Si on a tout, inutile d'aller plus loin
-                    if lvl_m and dance_m and public_m:
-                        break
+                # Détection de la danse
+                dance_m = _search_in_spaces(RE_DANCE, search_spaces)
+                is_sevi = bool(dance_m and re.search(r"s[ée]villan", dance_m.group(0), re.IGNORECASE))
 
-                # 5) Dernier filet : réutiliser un contexte déjà vu pour ce jour si dispo
-                jour_norm = seg["jour"]
-                ctx = contexte_par_jour.get(jour_norm, {"niveau": "", "danse": "", "public": ""})
+                # NIVEAU / PUBLIC
+                if is_sevi and spaces_with_sevi:
+                    # Pour Sévillane : co-occurrence stricte (et pas de "Technique" via LVL_SEVI)
+                    lvl_m    = _search_in_spaces(RE_LVL_SEVI, spaces_with_sevi)
+                    public_m = _search_in_spaces(RE_PUBLIC,    spaces_with_sevi)
+                else:
+                    # Flamenco (ou inconnu) : recherche standard
+                    lvl_m    = _search_in_spaces(RE_LVL,    search_spaces)
+                    public_m = _search_in_spaces(RE_PUBLIC, search_spaces)
 
-                niv_txt = (lvl_m.group(0) if lvl_m else ctx["niveau"])
-                dan_txt = (dance_m.group(0) if dance_m else ctx["danse"])
-                pub_txt = (public_m.group(0) if public_m else ctx["public"])
-
-                # Normalisations légères
-                def _norm_cap(s):
-                    s = (s or "").replace("·", "").strip()
-                    return s.capitalize() if s else ""
+                # Fallback : préfixe si rien trouvé
+                if not (lvl_m or public_m or dance_m) and pre_tail:
+                    lvl_m    = lvl_m    or _first_match(RE_LVL, pre_tail)
+                    public_m = public_m or _first_match(RE_PUBLIC, pre_tail)
+                    dance_m  = dance_m  or _first_match(RE_DANCE, pre_tail)
 
                 hours_text = " ".join(m.group(0) for m in hour_matches)
+                jour_norm = seg["jour"]
+
+                # Normalisation / garde-fous
+                niv_txt = (lvl_m.group(0) if lvl_m else "")
+                dan_txt = (dance_m.group(0) if dance_m else "")
+                pub_txt = (public_m.group(0) if public_m else "")
+
+                # Interdit "Technique" pour Sévillane sauf co-occurrence stricte (déjà gérée via LVL_SEVI)
+                if re.search(r"s[ée]villan", dan_txt or "", re.IGNORECASE) and re.search(r"\btechnique\b", niv_txt or "", re.IGNORECASE):
+                    niv_txt = ""  # annule sur-signal
+
                 item = {
                     "jour": jour_norm,
-                    "heures": hours_text.replace("–","-").replace("—","-"),
+                    "heures": hours_text.replace("–", "-").replace("—", "-"),
                     "heures_vocal": remplacer_h_par_heure(hours_text),
                     "niveau": _norm_cap(niv_txt),
                     "danse":  _norm_cap(sanitize_for_voice(dan_txt)),
                     "public": _norm_cap(pub_txt),
                 }
 
-                # Si on a réussi à trouver un des 3, on nourrit le contexte du jour
-                if item["niveau"] or item["danse"] or item["public"]:
-                    contexte_par_jour[jour_norm] = {
-                        "niveau": item["niveau"] or ctx["niveau"],
-                        "danse":  item["danse"]  or ctx["danse"],
-                        "public": item["public"] or ctx["public"],
-                    }
+                # Mise à jour de contexte par jour (reset si la danse change)
+                ctx = contexte_par_jour.get(jour_norm, {"niveau": "", "danse": "", "public": ""})
+                if item["danse"]:
+                    if ctx.get("danse") and ctx["danse"].lower() != item["danse"].lower():
+                        ctx = {"niveau": "", "danse": item["danse"], "public": ""}  # reset niveau/public
+                    else:
+                        ctx["danse"] = item["danse"]
+
+                # On nourrit le contexte seulement avec des infos sûres
+                if item["niveau"]:
+                    if not (re.search(r"s[ée]villan", item["danse"], re.IGNORECASE) and item["niveau"].lower() == "technique"):
+                        ctx["niveau"] = item["niveau"]
+                if item["public"]:
+                    ctx["public"] = item["public"]
+
+                contexte_par_jour[jour_norm] = ctx
 
                 keyi = (item["jour"], item["heures"], item["niveau"], item["danse"], item["public"])
                 if keyi not in seen_items:
                     seen_items.add(keyi)
                     horaires.append(item)
 
-        # Filtre anti-faux-positif : Flamenco Débutants Adultes le vendredi
+        # =========================
+        # 1.b) HORAIRES — Passe 2 (scan par lignes + voisinage ±3 lignes + reset de contexte à changement de danse)
+        # =========================
+        def _key_pair(jour, heures):
+            return (jour, heures.replace("–", "-").replace("—", "-").strip())
+
+        by_key = { _key_pair(h["jour"], h["heures"]): h for h in horaires }
+
+        ctx_danse = ""
+        ctx_public = ""
+        ctx_niveau = ""
+        NEIGHB = 3
+        N = len(lines)
+
+        for i, line in enumerate(lines):
+            if not line:
+                continue
+
+            # Mise à jour du contexte si la ligne contient des libellés
+            m_d = RE_DANCE.search(line)
+            m_p = RE_PUBLIC.search(line)
+            m_l = RE_LVL.search(line)
+
+            if m_d:
+                new_danse = m_d.group(0)
+                # Reset contexte si la danse change
+                if (ctx_danse or "").lower() != new_danse.lower():
+                    ctx_niveau = ""
+                    ctx_public = ""
+                ctx_danse = new_danse
+
+            if m_p:
+                ctx_public = m_p.group(0)
+            if m_l:
+                ctx_niveau = m_l.group(0)
+
+            # Détection d'une ligne horaire avec jour
+            if RE_DAY_TOKEN.search(line) and RE_ANY_HOUR.search(line):
+                jour = norm_day(RE_DAY_TOKEN.search(line).group(0))
+                hours_text = " ".join(m.group(0) for m in RE_ANY_HOUR.finditer(line))
+
+                # voisinage ±3 lignes
+                start = max(0, i - NEIGHB)
+                end   = min(N, i + NEIGHB + 1)
+                neigh_txt = "\n".join(lines[start:end])
+
+                # Recherche locale
+                danse  = (RE_DANCE.search(neigh_txt) or (RE_DANCE.search(ctx_danse) if isinstance(ctx_danse, str) else None))
+                is_sevi_line = bool(danse and re.search(r"s[ée]villan", danse.group(0), re.IGNORECASE))
+
+                if is_sevi_line:
+                    lvl    = (RE_LVL_SEVI.search(neigh_txt) or (RE_LVL_SEVI.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
+                else:
+                    lvl    = (RE_LVL.search(neigh_txt) or (RE_LVL.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
+
+                public = (RE_PUBLIC.search(neigh_txt) or (RE_PUBLIC.search(ctx_public) if isinstance(ctx_public, str) else None))
+
+                k = _key_pair(jour, hours_text)
+                item = by_key.get(k, {
+                    "jour": jour,
+                    "heures": hours_text.replace("–", "-").replace("—", "-"),
+                    "heures_vocal": remplacer_h_par_heure(hours_text),
+                    "niveau": "",
+                    "danse": "",
+                    "public": "",
+                })
+
+                # Compléter à partir de la ligne + contexte
+                niv_txt = (lvl.group(0) if lvl else ctx_niveau)
+                dan_txt = (sanitize_for_voice(danse.group(0) if danse else ctx_danse))
+                pub_txt = (public.group(0) if public else ctx_public)
+
+                # Sévillanes : ne jamais poser "Technique" depuis le contexte
+                if re.search(r"s[ée]villan", dan_txt or "", re.IGNORECASE) and (niv_txt or "").lower() == "technique":
+                    niv_txt = ""
+
+                item["niveau"] = item["niveau"] or _norm_cap(niv_txt)
+                item["danse"]  = item["danse"]  or _norm_cap(dan_txt)
+                item["public"] = item["public"] or _norm_cap(pub_txt)
+
+                by_key[k] = item
+
+        # Réécrit la liste horaires consolidée
+        horaires = list(by_key.values())
+
+        # =========================
+        # Filtres anti faux-positifs
+        # =========================
         def _is_flamenco_debutants_adultes_vendredi(item: dict) -> bool:
             jour   = (item.get("jour") or "").strip()
             danse  = (item.get("danse") or "").lower()
@@ -209,78 +333,20 @@ def infos_cours():
                 and "adulte" in public
                 and re.search(r"d[ée]but", niveau) is not None
             )
+
+        def _is_sevi_technique_vendredi(item: dict) -> bool:
+            return (
+                item.get("jour") == "Vendredi"
+                and re.search(r"s[ée]villan", item.get("danse", ""), re.IGNORECASE)
+                and item.get("niveau", "").lower() == "technique"
+            )
+
         horaires = [h for h in horaires if not _is_flamenco_debutants_adultes_vendredi(h)]
+        horaires = [h for h in horaires if not _is_sevi_technique_vendredi(h)]
 
-                # === 1.b SECONDE PASSE : Scan par lignes + contexte roulant, puis fusion ===
-        # élargir un peu les regex pour plus de cas
-        LVL_RX    = re.compile(r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)", re.IGNORECASE)
-        DANCE_RX  = RE_DANCE
-        PUBLIC_RX = re.compile(r"(tout\s*public|famille|parents|enfants?|ados?|adultes?)", re.IGNORECASE)
-
-        def _cap(s: str) -> str:
-            s = (s or "").replace("·", "").strip()
-            return s.capitalize() if s else ""
-
-        # index rapide pour dédupliquer / fusionner
-        def _key(jour, heures):
-            return (jour, heures.replace("–","-").replace("—","-").strip())
-
-        by_key = { _key(h["jour"], h["heures"]): h for h in horaires }
-
-        # contexte roulant mis à jour au fil des lignes
-        ctx_danse = ctx_public = ctx_niveau = ""
-
-        # fenêtre de voisinage (pour piocher les libellés sur lignes proches)
-        NEIGHB = 3
-        N = len(lines)
-
-        for i, line in enumerate(lines):
-            # mise à jour du contexte si une ligne ne contient que des libellés
-            m_d = DANCE_RX.search(line)
-            m_p = PUBLIC_RX.search(line)
-            m_l = LVL_RX.search(line)
-            if m_d: ctx_danse  = m_d.group(0)
-            if m_p: ctx_public = m_p.group(0)
-            if m_l: ctx_niveau = m_l.group(0)
-
-            # détecter une ligne horaire avec jour
-            if RE_DAY_TOKEN.search(line) and RE_ANY_HOUR.search(line):
-                jour = norm_day(RE_DAY_TOKEN.search(line).group(0))
-                hours_text = " ".join(m.group(0) for m in RE_ANY_HOUR.finditer(line))
-
-                # chercher aussi dans les lignes voisines (avant/après)
-                start = max(0, i - NEIGHB)
-                end   = min(N, i + NEIGHB + 1)
-                neigh_txt = "\n".join(lines[start:end])
-
-                lvl    = (LVL_RX.search(neigh_txt) or (LVL_RX.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
-                danse  = (DANCE_RX.search(neigh_txt) or (DANCE_RX.search(ctx_danse) if isinstance(ctx_danse, str) else None))
-                public = (PUBLIC_RX.search(neigh_txt) or (PUBLIC_RX.search(ctx_public) if isinstance(ctx_public, str) else None))
-
-                k = _key(jour, hours_text)
-                item = by_key.get(k, {
-                    "jour": jour,
-                    "heures": hours_text.replace("–","-").replace("—","-"),
-                    "heures_vocal": remplacer_h_par_heure(hours_text),
-                    "niveau": "",
-                    "danse": "",
-                    "public": "",
-                })
-
-                # compléter ce qui manque
-                item["niveau"] = item["niveau"] or _cap(lvl.group(0) if lvl else ctx_niveau)
-                item["danse"]  = item["danse"]  or _cap(sanitize_for_voice(danse.group(0) if danse else ctx_danse))
-                item["public"] = item["public"] or _cap(public.group(0) if public else ctx_public)
-
-                by_key[k] = item  # (ajoute ou met à jour)
-
-        # réécrire la liste horaires dédupliquée
-        horaires = list(by_key.values())
-
-        # Filtre anti-faux-positif conservé
-        horaires = [h for h in horaires if not _is_flamenco_debutants_adultes_vendredi(h)]
-
-        # 2) TARIFS
+        # =========================
+        # 2) TARIFS (comme avant)
+        # =========================
         tarifs_par_nb = {}
         tarifs_lignes = []
         tarifs_categories = {"adherents": [], "eleves": [], "non_adherents": []}
@@ -330,16 +396,29 @@ def infos_cours():
         m_ad = RE_ADHESION.search(full_txt)
         adhesion = f"{m_ad.group(1)} €" if m_ad else ""
 
-        # Niveaux Sévillanas
+        # Niveaux Sévillanes (info de synthèse éventuelle)
         niveaux_sevillane = []
         for l in lines:
             if re.search(r"s[ée]villan", l, re.IGNORECASE) and RE_LVL.search(l):
                 raw = RE_LVL.search(l).group(0).lower()
-                norm = "Débutants" if "debut" in raw or "début" in raw else ("Avancés" if "avanc" in raw else raw.capitalize())
+                if "debut" in raw or "début" in raw:
+                    norm = "Débutants"
+                elif "avanc" in raw:
+                    norm = "Avancés"
+                elif "inter" in raw:
+                    norm = "Intermédiaire"
+                elif "tous" in raw or "multi" in raw:
+                    norm = "Tous niveaux"
+                elif "initiation" in raw:
+                    norm = "Initiation"
+                else:
+                    norm = raw.capitalize()
                 if norm not in niveaux_sevillane:
                     niveaux_sevillane.append(norm)
 
-        # Version vocal
+        # =========================
+        # Version "vocale" des horaires
+        # =========================
         horaires_vocal = []
         for h in horaires:
             extra = " ".join([x for x in [h["danse"], h["public"], h["niveau"]] if x])
