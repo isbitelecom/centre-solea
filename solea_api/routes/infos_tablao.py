@@ -14,7 +14,7 @@ from ..utils import (
 
 bp = Blueprint("infos_tablao", __name__)
 BASE = "https://www.centresolea.org"
-SRC = f"{BASE}/"  # on filtre "tablao" depuis la page principale
+SRC = f"{BASE}/"  # titres "TABLAO ..." visibles dès la home
 
 
 def nz(s):  # None -> ''
@@ -54,17 +54,17 @@ def infos_tablao():
         }
         MOIS_ABBR = {
             "jan": 1, "janv": 1,
-            "fev": 2, "fevr": 2, "fév": 2,
+            "fev": 2, "fevr": 2, "fév": 2, "fév.": 2, "fev.": 2,
             "mar": 3,
-            "avr": 4,
+            "avr": 4, "avr.": 4,
             "mai": 5,
-            "jun": 6, "juin": 6,
-            "jul": 7, "juil": 7,
-            "aou": 8, "aoû": 8, "aout": 8, "août": 8,
-            "sep": 9, "sept": 9,
-            "oct": 10,
-            "nov": 11,
-            "dec": 12, "déc": 12
+            "juin": 6, "jun": 6,
+            "juil": 7, "juil.": 7, "jul": 7,
+            "aout": 8, "août": 8, "aou": 8, "aou.": 8,
+            "sept": 9, "sept.": 9, "sep": 9, "sep.": 9,
+            "oct": 10, "oct.": 10,
+            "nov": 11, "nov.": 11,
+            "dec": 12, "dec.": 12, "déc": 12, "déc.": 12,
         }
         MONTH_WORD_GROUP = (
             r"janvier|janv\.?|février|fevrier|févr\.?|fevr\.?|mars|avril|avr\.?|mai|juin|"
@@ -185,68 +185,91 @@ def infos_tablao():
                     seen_d.add(d); uniq.append(d)
             return uniq
 
-        # ====== Contexte large autour du titre ======
-        def gather_context_text(node, up_levels=4, prev_siblings=6, next_siblings=6):
+        # ====== Contexte élargi autour du titre + parcours précédent/suivant ======
+        def collect_near_text(node, max_prev=200, max_next=200):
             """
-            Remonte jusqu'à un conteneur "carte", puis récupère:
-             - tout le texte descendant (incluant petits <span>)
-             - texte des frères *précédents* et *suivants* (±N)
-             - attributs utiles (time[datetime], aria-label, title, data-*)
+            Concatène :
+             - texte/attributs du conteneur ancêtre (quelques niveaux)
+             - frères précédents/suivants
+             - previous_elements / next_elements (flux DOM) limités
+            Inclut attrs utiles: <time datetime>, aria-label, title, data-*
             """
-            # remonter
+            parts = []
+
+            def push(s):
+                s = norm(s)
+                if s:
+                    parts.append(s)
+
+            # remonter à un ancêtre "carte"
             anc = node
             levels = 0
-            while anc.parent is not None and levels < up_levels:
+            while anc.parent is not None and levels < 5:
                 anc = anc.parent
                 levels += 1
-                # heuristique d'arrêt si le conteneur est dense (beaucoup de spans ou présence de <time>)
                 try:
                     if anc.find("time") or len(list(anc.find_all("span"))) >= 3:
                         break
                 except Exception:
                     break
 
-            pieces = []
-
-            def push(s):
-                s = norm(s)
-                if s:
-                    pieces.append(s)
-
-            # descendants + attributs
+            # Descendants + attrs
             if hasattr(anc, "find_all"):
-                for el in anc.find_all(True, limit=300):
-                    # <time>
+                for el in anc.find_all(True, limit=400):
                     if el.name == "time":
                         dt = el.get("datetime")
                         if dt: push(dt)
                     for attr in ("aria-label", "title", "data-title", "data-date", "data-datetime"):
                         v = el.get(attr)
                         if v: push(v)
-                    txt = el.get_text(" ", strip=True)
-                    push(txt)
+                    push(el.get_text(" ", strip=True))
 
-            # frères précédents
+            # Frères précédents et suivants (du parent direct du titre)
+            parent = node.parent or node
+            for sib in list(getattr(parent, "previous_siblings", []))[-6:]:
+                if hasattr(sib, "get_text"):
+                    push(sib.get_text(" ", strip=True))
+                elif isinstance(sib, NavigableString):
+                    push(str(sib))
+            steps = 0
+            for sib in getattr(parent, "next_siblings", []):
+                if steps >= 6: break
+                steps += 1
+                if hasattr(sib, "get_text"):
+                    push(sib.get_text(" ", strip=True))
+                elif isinstance(sib, NavigableString):
+                    push(str(sib))
+
+            # Flux DOM : éléments précédents / suivants proches
             psteps = 0
-            for ps in getattr(anc, "previous_siblings", []):
-                if psteps >= prev_siblings: break
+            for el in node.previous_elements:
+                if psteps >= max_prev: break
                 psteps += 1
-                if hasattr(ps, "get_text"):
-                    push(ps.get_text(" ", strip=True))
-                elif isinstance(ps, NavigableString):
-                    push(str(ps))
+                if hasattr(el, "get"):
+                    if el.name == "time" and el.get("datetime"): push(el.get("datetime"))
+                    for attr in ("aria-label", "title", "data-title", "data-date", "data-datetime"):
+                        v = el.get(attr); 
+                        if v: push(v)
+                if hasattr(el, "get_text"):
+                    push(el.get_text(" ", strip=True))
+                elif isinstance(el, NavigableString):
+                    push(str(el))
 
-            # frères suivants
             nsteps = 0
-            for ns in getattr(anc, "next_siblings", []):
-                if nsteps >= next_siblings: break
+            for el in node.next_elements:
+                if nsteps >= max_next: break
                 nsteps += 1
-                if hasattr(ns, "get_text"):
-                    push(ns.get_text(" ", strip=True))
-                elif isinstance(ns, NavigableString):
-                    push(str(ns))
+                if hasattr(el, "get"):
+                    if el.name == "time" and el.get("datetime"): push(el.get("datetime"))
+                    for attr in ("aria-label", "title", "data-title", "data-date", "data-datetime"):
+                        v = el.get(attr); 
+                        if v: push(v)
+                if hasattr(el, "get_text"):
+                    push(el.get_text(" ", strip=True))
+                elif isinstance(el, NavigableString):
+                    push(str(el))
 
-            return "\n".join(pieces)
+            return "\n".join([p for p in parts if p])
 
         # ====== Détail (fallback) ======
         def parse_detail(url: str):
@@ -272,7 +295,7 @@ def infos_tablao():
                 a = getattr(node, "find", lambda *_: None)("a")
                 if a and a.get("href"):
                     return urljoin(BASE, nz(a.get("href")))
-                # explorer quelques frères du parent du titre
+                # frères du parent
                 parent = node.parent or node
                 steps = 0
                 for sib in parent.next_siblings:
@@ -283,7 +306,7 @@ def infos_tablao():
                             href = nz(cand.get("href"))
                             if href:
                                 return urljoin(BASE, href)
-                # explorer des ancêtres
+                # ancêtres
                 anc = node.parent
                 depth = 0
                 while getattr(anc, "select", None) and depth < 5:
@@ -312,22 +335,22 @@ def infos_tablao():
         for node in title_nodes:
             title = norm(node.get_text(" ", strip=True)) or "Tablao"
 
-            # 1) Contexte large (inclut “sam. 27 sept.” même éclaté)
-            ctx = gather_context_text(node, up_levels=4, prev_siblings=6, next_siblings=6)
+            # 1) Contexte très large (attrape “sam. 27 sept.”)
+            ctx = collect_near_text(node)
             dates = any_date_in(ctx)
             hr = nz(extract_time_from_text(ctx))
-            # Lieu simple: après un tiret / avant-dernier segment
+
+            # 2) Lieu simple: après tiret / ou ville explicite
             def extract_lieu(txt: str) -> str:
                 t = nz(txt)
                 parts = re.split(r"\s+(?:-|—|–|@)\s+", t)
                 if len(parts) >= 2:
                     return parts[-1].strip()
-                # sinon, ville en clair
                 mcity = re.search(r"\b(Marseille|Aix|Nice|Lyon|Toulouse|Paris)\b", t, re.IGNORECASE)
                 return mcity.group(1) if mcity else ""
             lieu = extract_lieu(ctx)
 
-            # 2) fallback: page de détails si pas de date
+            # 3) fallback: page de détails si pas de date
             if not dates:
                 href = find_related_href(node)
                 if href:
@@ -336,29 +359,26 @@ def infos_tablao():
                     if hr2 and not hr: hr = hr2
                     if lieu2 and not lieu: lieu = lieu2
 
+            # si toujours pas de date -> on ignore (tu veux uniquement les "prochains")
+            if not dates:
+                continue
+
             titre_norm = sanitize_for_voice(title)
             lieu_norm = sanitize_for_voice(lieu)
 
-            # 3) si toujours pas de date, on garde l’info (date vide) OU on peut "continue" si tu veux uniquement des dated
-            if not dates:
-                k = ("", titre_norm.lower()[:160], hr)
-                if k not in seen:
-                    seen.add(k)
-                    items.append({
-                        "type": "tablao",
-                        "date": "",
-                        "date_spoken": "",
-                        "heure": hr,
-                        "heure_vocal": remplacer_h_par_heure(hr),
-                        "titre": titre_norm,
-                        "lieu": lieu_norm,
-                    })
-                continue
-
-            # 4) une entrée par date
             for dd in dates:
+                # filtre: uniquement à venir
+                try:
+                    dday, dmon, dyear = [int(x) for x in dd.split("/")]
+                    d_obj = date(dyear, dmon, dday)
+                except Exception:
+                    continue
+                if d_obj < date.today():
+                    continue
+
                 k = (dd, titre_norm.lower()[:160], hr)
-                if k in seen: continue
+                if k in seen: 
+                    continue
                 seen.add(k)
                 items.append({
                     "type": "tablao",
@@ -370,26 +390,20 @@ def infos_tablao():
                     "lieu": lieu_norm,
                 })
 
-        # ===== Tri : avec date d'abord =====
+        # ===== Tri chrono =====
         def sort_key(e):
-            d = nz(e.get("date"))
-            if d:
-                try:
-                    dd, mm, yy = d.split("/")
-                    return (0, int(yy), int(mm), int(dd))
-                except Exception:
-                    pass
-            return (1, 9999, 12, 31)
+            try:
+                dd, mm, yy = e["date"].split("/")
+                return (int(yy), int(mm), int(dd))
+            except Exception:
+                return (9999, 12, 31)
 
         items.sort(key=sort_key)
 
         # ===== Version vocale =====
         tablaos_vocal = []
         for e in items:
-            if e.get("date_spoken"):
-                parts = [f"Tablao le {e['date_spoken']}"]
-            else:
-                parts = ["Tablao"]
+            parts = [f"Tablao le {e['date_spoken']}"]
             if e.get("heure_vocal"): parts.append(f"à {e['heure_vocal']}")
             if e.get("lieu"): parts.append(f"au {e['lieu']}")
             parts.append(f": {e['titre']}")
