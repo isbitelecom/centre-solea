@@ -211,6 +211,75 @@ def infos_cours():
             )
         horaires = [h for h in horaires if not _is_flamenco_debutants_adultes_vendredi(h)]
 
+                # === 1.b SECONDE PASSE : Scan par lignes + contexte roulant, puis fusion ===
+        # élargir un peu les regex pour plus de cas
+        LVL_RX    = re.compile(r"(débutant(?:·|\.|e|es|s)?|debutant(?:·|\.|e|es|s)?|initiation|tous\s*niveaux|multi\s*niveaux|interm[ée]diaire|inter(?:\s*1|\s*2)?|avanc[ée]s?|perfectionnement|technique)", re.IGNORECASE)
+        DANCE_RX  = RE_DANCE
+        PUBLIC_RX = re.compile(r"(tout\s*public|famille|parents|enfants?|ados?|adultes?)", re.IGNORECASE)
+
+        def _cap(s: str) -> str:
+            s = (s or "").replace("·", "").strip()
+            return s.capitalize() if s else ""
+
+        # index rapide pour dédupliquer / fusionner
+        def _key(jour, heures):
+            return (jour, heures.replace("–","-").replace("—","-").strip())
+
+        by_key = { _key(h["jour"], h["heures"]): h for h in horaires }
+
+        # contexte roulant mis à jour au fil des lignes
+        ctx_danse = ctx_public = ctx_niveau = ""
+
+        # fenêtre de voisinage (pour piocher les libellés sur lignes proches)
+        NEIGHB = 3
+        N = len(lines)
+
+        for i, line in enumerate(lines):
+            # mise à jour du contexte si une ligne ne contient que des libellés
+            m_d = DANCE_RX.search(line)
+            m_p = PUBLIC_RX.search(line)
+            m_l = LVL_RX.search(line)
+            if m_d: ctx_danse  = m_d.group(0)
+            if m_p: ctx_public = m_p.group(0)
+            if m_l: ctx_niveau = m_l.group(0)
+
+            # détecter une ligne horaire avec jour
+            if RE_DAY_TOKEN.search(line) and RE_ANY_HOUR.search(line):
+                jour = norm_day(RE_DAY_TOKEN.search(line).group(0))
+                hours_text = " ".join(m.group(0) for m in RE_ANY_HOUR.finditer(line))
+
+                # chercher aussi dans les lignes voisines (avant/après)
+                start = max(0, i - NEIGHB)
+                end   = min(N, i + NEIGHB + 1)
+                neigh_txt = "\n".join(lines[start:end])
+
+                lvl    = (LVL_RX.search(neigh_txt) or (LVL_RX.search(ctx_niveau) if isinstance(ctx_niveau, str) else None))
+                danse  = (DANCE_RX.search(neigh_txt) or (DANCE_RX.search(ctx_danse) if isinstance(ctx_danse, str) else None))
+                public = (PUBLIC_RX.search(neigh_txt) or (PUBLIC_RX.search(ctx_public) if isinstance(ctx_public, str) else None))
+
+                k = _key(jour, hours_text)
+                item = by_key.get(k, {
+                    "jour": jour,
+                    "heures": hours_text.replace("–","-").replace("—","-"),
+                    "heures_vocal": remplacer_h_par_heure(hours_text),
+                    "niveau": "",
+                    "danse": "",
+                    "public": "",
+                })
+
+                # compléter ce qui manque
+                item["niveau"] = item["niveau"] or _cap(lvl.group(0) if lvl else ctx_niveau)
+                item["danse"]  = item["danse"]  or _cap(sanitize_for_voice(danse.group(0) if danse else ctx_danse))
+                item["public"] = item["public"] or _cap(public.group(0) if public else ctx_public)
+
+                by_key[k] = item  # (ajoute ou met à jour)
+
+        # réécrire la liste horaires dédupliquée
+        horaires = list(by_key.values())
+
+        # Filtre anti-faux-positif conservé
+        horaires = [h for h in horaires if not _is_flamenco_debutants_adultes_vendredi(h)]
+
         # 2) TARIFS
         tarifs_par_nb = {}
         tarifs_lignes = []
