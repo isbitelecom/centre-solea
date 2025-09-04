@@ -87,11 +87,24 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 def ddmmyyyy_to_spoken(ddmmyyyy: str) -> str:
+    """
+    Convertit 'dd/mm/yyyy' → 'd <mois en toutes lettres> yyyy'.
+    Accepte aussi 'dd/<mois texte>/yyyy' (ex: '12/oct/2025', '1/octobre/2025').
+    """
     if not ddmmyyyy:
         return ""
     try:
         d, m, y = ddmmyyyy.split("/")
-        return f"{int(d)} {MONTHS_FR_SPOKEN[int(m)]} {int(y)}"
+        d_int = int(d)
+        m_raw = (m or "").strip().lower().rstrip(".")
+        if m_raw.isdigit():
+            m_int = int(m_raw)
+        else:
+            m_int = MONTHS_FR.get(m_raw) or MONTHS_FR.get(m_raw[:3])
+        if not m_int or not (1 <= m_int <= 12):
+            return ddmmyyyy
+        y_int = int(y)
+        return f"{d_int} {MONTHS_FR_SPOKEN[m_int]} {y_int}"
     except Exception:
         return ddmmyyyy
 
@@ -166,7 +179,6 @@ def fetch_html(url: str) -> str:
         if r.encoding is None:
             r.encoding = "utf-8"
         txt = r.text
-        # si très peu de texte (Wix pre-render), on réessaie
         if len(normalize_text(BeautifulSoup(txt, "lxml").get_text(" ", strip=True))) < 200:
             r2 = requests.get(url, headers=HEADERS_B, timeout=(REQ_TIMEOUT[0], max(REQ_TIMEOUT[1], 14)))
             r2.raise_for_status()
@@ -176,7 +188,7 @@ def fetch_html(url: str) -> str:
     except Exception:
         r = requests.get(url, headers=HEADERS_B, timeout=(REQ_TIMEOUT[0], max(REQ_TIMEOUT[1], 14)))
         r.raise_for_status()
-        r.encoding = r.encoding or "utf-8"
+        r.encoding = r2.encoding or "utf-8"
         return r.text
 
 def soup_from_html(html: str) -> BeautifulSoup:
