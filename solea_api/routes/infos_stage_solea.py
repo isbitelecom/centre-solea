@@ -1,10 +1,11 @@
 # solea_api/routes/infos_stage_solea.py
 from flask import Blueprint, jsonify, request
 import re
+import unicodedata
 from ..utils import (
     fetch_html, soup_from_html, normalize_text, sanitize_for_voice,
     extract_time_from_text, classify_type, ddmmyyyy_to_spoken, fmt_date,
-    infer_school_year_for_month, month_to_int_any, parse_date_any,
+    infer_school_year_for_month, parse_date_any,
     cache_key, cache_get, cache_set, cache_meta
 )
 
@@ -23,34 +24,80 @@ RE_PRICE_ANY = re.compile(r"€")
 RE_TARIF_CAT = re.compile(r"(?i)\b(adh[ée]rents?|non\s*adh[ée]rents?|[ée]l[eè]ves?)\b[^0-9]{0,20}([0-9 ][0-9 ]*)\s*€")
 
 
-# --- Helpers anti-"oct" → int() ---
-def _ensure_month_int(m):
-    """Retourne un mois 1..12 en int depuis int/str/abréviation FR."""
+# ---------- Helpers robustes ----------
+def _strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+def month_to_int_any_fr(m) -> int:
+    """
+    Convertit n'importe quelle forme FR de mois (abrégé/long, avec/ sans point, avec/ sans accents)
+    en entier 1..12. Lève ValueError si inconnu.
+    """
     if isinstance(m, int):
-        return m
-    s = str(m).strip().lower()
-    # tente direct int (ex: "10")
-    try:
-        return int(s)
-    except Exception:
-        pass
-    # sinon passe par month_to_int_any (gère "oct", "oct.", "octobre", etc.)
-    mi = month_to_int_any(s)
-    if isinstance(mi, int):
-        return mi
-    # si month_to_int_any renvoie un str, re-tente int; sinon erreur claire
-    try:
-        return int(str(mi).strip())
-    except Exception:
-        raise ValueError(f"Mois invalide: {m!r}")
+        if 1 <= m <= 12:
+            return m
+        raise ValueError(f"Mois hors plage: {m}")
+    s = str(m).strip().lower().replace('.', '')
+    s_ascii = _strip_accents(s)
+
+    # ex: "10" → 10
+    if s_ascii.isdigit():
+        mi = int(s_ascii)
+        if 1 <= mi <= 12:
+            return mi
+        raise ValueError(f"Mois hors plage: {m}")
+
+    # mapping large
+    MAP = {
+        # jan
+        "jan": 1, "janv": 1, "janvier": 1,
+        # fev
+        "fev": 2, "fevr": 2, "fevrier": 2, "fevri": 2, "fe": 2, "fevrie": 2,  # tolérances
+        # mar
+        "mar": 3, "mars": 3,
+        # avr
+        "avr": 4, "avril": 4,
+        # mai
+        "mai": 5,
+        # juin/juil
+        "juin": 6,
+        "juil": 7, "juillet": 7,
+        # aout/août
+        "aout": 8, "aou": 8, "aoutre": 8, "aouut": 8, "aoutt": 8,  # tolérances
+        # sept
+        "sep": 9, "sept": 9, "septembre": 9,
+        # oct
+        "oct": 10, "octobre": 10,
+        # nov
+        "nov": 11, "novembre": 11,
+        # dec/déc
+        "dec": 12, "decembre": 12, "de": 12, "décembre": 12  # "décembre" restera si accents non retirés
+    }
+
+    # formes exactes courantes après strip accents & points
+    COMMON = {
+        "janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
+        "juin": 6, "juillet": 7, "aout": 8, "septembre": 9,
+        "octobre": 10, "novembre": 11, "decembre": 12
+    }
+
+    if s_ascii in COMMON:
+        return COMMON[s_ascii]
+    if s_ascii in MAP:
+        return MAP[s_ascii]
+
+    # essais sur les 3 premières lettres pour cas du style "jan", "oct"
+    if len(s_ascii) >= 3 and s_ascii[:3] in MAP:
+        return MAP[s_ascii[:3]]
+
+    raise ValueError(f"Mois invalide: {m!r}")
 
 def _ensure_day_int(d):
-    """Force le jour en int."""
     return int(str(d).strip())
 
 def safe_fmt_date(y, m, d):
     """Appelle fmt_date avec mois/jour garantis en int."""
-    mi = _ensure_month_int(m)
+    mi = month_to_int_any_fr(m)
     di = _ensure_day_int(d)
     return fmt_date(y, mi, di)
 
@@ -90,7 +137,6 @@ def detect_date_block(s: str):
         y = int(yy) if yy else None
         if y is not None and y < 100:
             y += 2000
-        # mo est numérique : on force en int
         return safe_fmt_date(y, int(mo), d), ""
 
     return "", ""
